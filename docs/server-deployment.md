@@ -1,136 +1,120 @@
 # Server Deployment Recipe
 
-Full deployment of Browser Automation MCP on a remote Linux server (Ubuntu 24.04, Hermes Agent).
+This recipe deploys the Browser Automation MCP server on Linux, Android/Termux proot, or a remote Hermes host. The server itself is a Python stdio MCP process; it needs a Chrome/Chromium/Brave CDP endpoint.
 
-## 1. Prerequisites
-
-```bash
-# Xvfb for headless display
-apt install xvfb
-
-# Python websocket-client (MCP server dependency)
-pip install websocket-client  # or: pip install --break-system-packages websocket-client
-
-# Brave browser
-apt install brave-browser  # or snap install brave
-```
-
-## 2. Start Xvfb
+## 1. Install Python dependency
 
 ```bash
-Xvfb :99 -screen 0 1920x1080x24 &
-# Or as systemd service (usually already running from desktop)
+python3 -m pip install -r requirements.txt
 ```
 
-## 3. Brave systemd user service
+If installing globally is blocked, use a virtualenv:
 
-File: `~/.config/systemd/user/brave-cdp.service`
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
 
-```ini
-[Unit]
-Description=Brave Browser with CDP
-After=network-online.target
+## 2. Start a browser with CDP
 
-[Service]
-Type=simple
-Environment=DISPLAY=:99
-ExecStart=/usr/bin/brave-browser \
+Linux/headless example:
+
+```bash
+chromium-browser \
+  --headless=new \
+  --no-sandbox \
+  --disable-dev-shm-usage \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=9223 \
+  --user-data-dir=/tmp/browser-automation-profile
+```
+
+Brave example:
+
+```bash
+brave-browser \
+  --remote-debugging-address=127.0.0.1 \
   --remote-debugging-port=9223 \
   --remote-allow-origins=* \
   --no-first-run \
   --no-default-browser-check \
-  --user-data-dir=/tmp/brave-debug-profile \
-  --disable-gpu \
-  --no-sandbox \
-  --disable-dev-shm-usage \
-  --password-store=basic
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=default.target
+  --user-data-dir=/tmp/brave-browser-automation-profile
 ```
 
-CRITICAL: `--remote-allow-origins=*` is MANDATORY. Without it, CDP WebSocket connections get 403 Forbidden.
+Verify CDP:
 
-Enable and start:
 ```bash
-systemctl --user daemon-reload
-systemctl --user enable brave-cdp
-systemctl --user start brave-cdp
+curl -s http://127.0.0.1:9223/json/version
 ```
 
-Verify:
-```bash
-curl -s 127.0.0.1:9223/json/version  # Should return Chrome version JSON
-```
+Expected: JSON containing `Browser` and `webSocketDebuggerUrl`.
 
-## 4. Deploy MCP Server
+## 3. Hermes MCP configuration
 
-Copy `server.py` to server:
-```bash
-mkdir -p ~/.hermes/mcp-servers/browser-automation
-scp server.py user@host:~/.hermes/mcp-servers/browser-automation/server.py
-```
-
-## 5. Config.yaml
-
-Add to `mcp_servers`:
 ```yaml
 mcp_servers:
   browser-automation:
+    enabled: true
     command: /usr/bin/python3
     args:
-      - /home/Hermes/.hermes/mcp-servers/browser-automation/server.py
-    timeout: 60
-    connect_timeout: 15
-    enabled: true
+      - /absolute/path/to/browser-automation-mcp/server.py
+    timeout: 120
+    connect_timeout: 30
     env:
-      BROWSER_CDP_URL: "http://127.0.0.1:9223"
-      CODEX_DEBUG_TOKEN: ${CODEX_DEBUG_TOKEN}
+      BROWSER_CDP_URL: http://127.0.0.1:9223
+      BROWSER_TIMEOUT: "30"
+      BROWSER_HTTP_TIMEOUT: "10"
+      BROWSER_AUTOSTART_CDP: "1"
+      BROWSER_ARTIFACT_DIR: /root/.hermes/cache/documents/browser-automation
 ```
 
-Add to `terminal.env_passthrough`:
-```yaml
-terminal:
-  env_passthrough:
-    - BROWSER_CDP_URL
-    - BROWSER_AUTH_TOKEN
-    - BROWSER_TIMEOUT
-    - CODEX_DEBUG_TOKEN
-    - CDP_BRIDGE_PORT
-    - CDP_BRIDGE_TOKEN
-```
+Optional env vars:
 
-## 6. Restart Hermes
+| Variable | Default | Purpose |
+|---|---:|---|
+| `BROWSER_CDP_URL` | `http://127.0.0.1:9223` | CDP HTTP endpoint |
+| `BROWSER_TIMEOUT` | `30` | WebSocket command timeout in seconds |
+| `BROWSER_HTTP_TIMEOUT` | `10` | CDP `/json` HTTP timeout in seconds |
+| `BROWSER_AUTOSTART_CDP` | `1` | Try `BROWSER_CDP_START_CMD` when CDP is down |
+| `BROWSER_CDP_START_CMD` | `~/.local/bin/browser-cdp-start` | Best-effort browser/CDP start command |
+| `BROWSER_ARTIFACT_DIR` | `~/.hermes/cache/documents/browser-automation` | File artifact output directory |
+| `BROWSER_AUTH_TOKEN` | empty | Optional bearer token for protected CDP bridges |
+
+## 4. Smoke tests
+
+Without requiring a live browser:
 
 ```bash
-# Find correct restart command for the deployment
-/home/Hermes/.hermes/bin/herm-start restart
-# OR
-/home/Hermes/.hermes/hermes restart
+python3 -m py_compile server.py scripts/smoke_mcp.py scripts/make_release_export.py
+python3 scripts/smoke_mcp.py ./server.py
 ```
 
-## 7. Verify
+With a live CDP endpoint:
 
 ```bash
-# Test MCP tools list
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | \
-  python3 ~/.hermes/mcp-servers/browser-automation/server.py 2>/dev/null
-
-# Should return 19 tools: browser_navigate, browser_cookies, browser_exec...
-
-# Quick smoke test
-export CODEX_DEBUG_TOKEN="your-token"
-python3 /tmp/smoke_test.py  # See templates/smoke-test.py
+BROWSER_CDP_URL=http://127.0.0.1:9223 python3 scripts/smoke_mcp.py ./server.py --health
 ```
+
+## 5. Remote/SSH wrapper pattern
+
+For a remote browser host, keep Hermes local but run the MCP server over SSH stdio:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+exec ssh user@host 'BROWSER_CDP_URL=http://127.0.0.1:9223 exec /path/to/browser-automation-mcp/server.py'
+```
+
+Then set Hermes `command` to the wrapper path.
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
+| Symptom | Likely cause | Fix |
 |---|---|---|
-| `Connection Refused` on :9223 | Brave not running | `systemctl --user restart brave-cdp` |
-| `ws_error: Handshake status 403` | Missing `--remote-allow-origins=*` | Restart brave-cdp (service has the flag) |
-| Empty results from navigate | handler calls `_safe_ws()` 3 times | Single `_safe_ws` call with all commands |
-| MCP returns `error` not `result` | CDP unreachable or WebSocket timeout | Check `curl 127.0.0.1:9223/json/version` |
-| 220+ `chrome://newtab/` tabs | Brave session leak | `systemctl --user restart brave-cdp` |
+| `CDP not reachable` | Browser is not running or wrong port | Check `/json/version`, start browser |
+| `Connection refused` | CDP bound to IPv6 or different address | Add `--remote-debugging-address=127.0.0.1` |
+| WebSocket 403 | Browser rejects CDP WebSocket origin | Add `--remote-allow-origins=*` for localhost-only browser |
+| Many stale tabs | Automation did not close created tabs | Use `browser_closetab` and isolate test tabs |
+| No artifact files | Directory missing/permission issue | Set writable `BROWSER_ARTIFACT_DIR` |
+| `websocket-client not installed` | Missing dependency | `python3 -m pip install -r requirements.txt` |

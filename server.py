@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Universal Browser Automation MCP Server v1.3
+Universal Browser Automation MCP Server v1.4
 Direct Chrome DevTools Protocol WebSocket client.
 
 Keeps the original browser-control tools and adds operational health/autostart,
 page summarization, element discovery, text-click/text-wait helpers, select controls,
-and batch execution for fewer MCP round-trips.
+file artifacts, safe redaction defaults, page snapshots, lightweight network/API
+discovery, and batch execution for fewer MCP round-trips.
 Still uses direct Chrome DevTools Protocol HTTP/WebSocket and no public BrowserMCP.
 """
 
+import base64
 import json
 import os
+import re
 import sys
 import time
 import subprocess
@@ -25,10 +28,11 @@ TOKEN = os.environ.get("CODEX_DEBUG_TOKEN", os.environ.get("BROWSER_AUTH_TOKEN",
 TIMEOUT = int(os.environ.get("BROWSER_TIMEOUT", "30"))
 HTTP_TIMEOUT = int(os.environ.get("BROWSER_HTTP_TIMEOUT", "10"))
 DEFAULT_TAB_URL = "about:blank"
+ARTIFACT_DIR = os.environ.get("BROWSER_ARTIFACT_DIR", os.path.expanduser("~/.hermes/cache/documents/browser-automation"))
 AUTOSTART_CDP = os.environ.get("BROWSER_AUTOSTART_CDP", "1").lower() not in {"0", "false", "no", "off"}
 CDP_START_CMD = os.environ.get("BROWSER_CDP_START_CMD", os.path.expanduser("~/.local/bin/browser-cdp-start"))
 CDP_START_TIMEOUT = int(os.environ.get("BROWSER_CDP_START_TIMEOUT", "45"))
-SERVER_VERSION = "1.3.0"
+SERVER_VERSION = "1.4.0"
 _cdp_start_attempted = False
 
 try:
@@ -311,6 +315,85 @@ def _redact_cookie(c: Dict[str, Any]) -> Dict[str, Any]:
         out["value"] = f"[redacted len={len(str(out['value']))}]"
     return out
 
+
+SENSITIVE_KEY_RE = re.compile(r"(cookie|session|token|secret|passwd|password|auth|bearer|jwt|csrf|xsrf|api[-_]?key|access[-_]?key)", re.I)
+
+
+def _is_sensitive_key(key: Any) -> bool:
+    return bool(SENSITIVE_KEY_RE.search(str(key or "")))
+
+
+def _redact_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (int, float, bool)):
+        return value
+    text = str(value)
+    return f"[redacted len={len(text)}]"
+
+
+def _redact_mapping(data: Any) -> Any:
+    """Redact likely secret values while keeping non-secret shape useful for agents."""
+    if isinstance(data, dict):
+        redacted: Dict[str, Any] = {}
+        for key, value in data.items():
+            if _is_sensitive_key(key):
+                redacted[str(key)] = _redact_value(value)
+            elif isinstance(value, (dict, list)):
+                redacted[str(key)] = _redact_mapping(value)
+            else:
+                redacted[str(key)] = value
+        return redacted
+    if isinstance(data, list):
+        return [_redact_mapping(item) for item in data]
+    return data
+
+
+def _safe_filename(prefix: str, ext: str) -> str:
+    clean_prefix = re.sub(r"[^a-zA-Z0-9_.-]+", "-", prefix or "browser")[:80].strip(".-") or "browser"
+    clean_ext = re.sub(r"[^a-zA-Z0-9]+", "", ext or "bin")[:16] or "bin"
+    return f"{clean_prefix}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.{clean_ext}"
+
+
+def _artifact_path(prefix: str, ext: str) -> str:
+    os.makedirs(ARTIFACT_DIR, exist_ok=True)
+    return os.path.join(ARTIFACT_DIR, _safe_filename(prefix, ext))
+
+
+def _write_b64_artifact(prefix: str, ext: str, data_b64: str) -> Dict[str, Any]:
+    raw = base64.b64decode(data_b64.encode("ascii"), validate=False) if data_b64 else b""
+    path = _artifact_path(prefix, ext)
+    with open(path, "wb") as f:
+        f.write(raw)
+    try:
+        os.chmod(path, 0o644)
+    except Exception:
+        pass
+    return {"path": path, "bytes": len(raw)}
+
+
+def _write_text_artifact(prefix: str, ext: str, text: str) -> Dict[str, Any]:
+    data = (text or "").encode("utf-8")
+    path = _artifact_path(prefix, ext)
+    with open(path, "wb") as f:
+        f.write(data)
+    try:
+        os.chmod(path, 0o644)
+    except Exception:
+        pass
+    return {"path": path, "bytes": len(data)}
+
+
+def _public_tab(t: Dict[str, Any], include_debug_url: bool = False) -> Dict[str, Any]:
+    out = {"id": t.get("id"), "url": t.get("url"), "title": t.get("title"), "type": t.get("type")}
+    if include_debug_url:
+        out["webSocketDebuggerUrl"] = t.get("webSocketDebuggerUrl")
+    return out
+
+
+def _media_hint(ext: str) -> str:
+    return {"png": "image/png", "pdf": "application/pdf", "html": "text/html", "json": "application/json"}.get(ext, "application/octet-stream")
+
 # ====== TOOLS ======
 
 TAB_PROPS = {
@@ -320,10 +403,11 @@ TAB_PROPS = {
 
 TOOLS = [
     {"name": "browser_navigate", "description": "Перейти на указанный URL в браузере. Возвращает заголовок, URL и tab_id.", "inputSchema": {"type": "object", "properties": {"url": {"type": "string", "description": "URL для перехода"}, "tab_id": TAB_PROPS["tab_id"], "wait_until_ready": {"type": "boolean", "default": True}}, "required": ["url"]}},
-    {"name": "browser_screenshot", "description": "Сделать скриншот текущей страницы. Возвращает base64 PNG.", "inputSchema": {"type": "object", "properties": {"full_page": {"type": "boolean", "default": False}, **TAB_PROPS}}},
-    {"name": "browser_cookies", "description": "Извлечь cookies, document.cookie и storage сайта.", "inputSchema": {"type": "object", "properties": {"url_filter": TAB_PROPS["url_filter"], "tab_id": TAB_PROPS["tab_id"], "redact": {"type": "boolean", "default": False}}}},
-    {"name": "browser_localstorage", "description": "Получить localStorage сайта.", "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}, **TAB_PROPS}}},
-    {"name": "browser_sessionstorage", "description": "Получить sessionStorage сайта.", "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}, **TAB_PROPS}}},
+    {"name": "browser_screenshot", "description": "Сделать скриншот текущей страницы. Возвращает base64 PNG; для GitHub/чатов лучше browser_screenshot_file.", "inputSchema": {"type": "object", "properties": {"full_page": {"type": "boolean", "default": False}, **TAB_PROPS}}},
+    {"name": "browser_screenshot_file", "description": "Сделать PNG-скриншот и сохранить файлом в BROWSER_ARTIFACT_DIR / Hermes document cache.", "inputSchema": {"type": "object", "properties": {"full_page": {"type": "boolean", "default": False}, "filename_prefix": {"type": "string", "default": "browser-screenshot"}, **TAB_PROPS}}},
+    {"name": "browser_cookies", "description": "Извлечь cookies, document.cookie и storage сайта. По умолчанию секреты редактируются.", "inputSchema": {"type": "object", "properties": {"url_filter": TAB_PROPS["url_filter"], "tab_id": TAB_PROPS["tab_id"], "redact": {"type": "boolean", "default": True}}}},
+    {"name": "browser_localstorage", "description": "Получить localStorage сайта. По умолчанию значения с secret-like ключами редактируются.", "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}, "redact": {"type": "boolean", "default": True}, **TAB_PROPS}}},
+    {"name": "browser_sessionstorage", "description": "Получить sessionStorage сайта. По умолчанию значения с secret-like ключами редактируются.", "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}, "redact": {"type": "boolean", "default": True}, **TAB_PROPS}}},
     {"name": "browser_exec", "description": "Выполнить JavaScript на странице и вернуть результат.", "inputSchema": {"type": "object", "properties": {"expression": {"type": "string"}, "await_promise": {"type": "boolean", "default": False}, **TAB_PROPS}, "required": ["expression"]}},
     {"name": "browser_click", "description": "Кликнуть по элементу по CSS-селектору.", "inputSchema": {"type": "object", "properties": {"selector": {"type": "string"}, **TAB_PROPS}, "required": ["selector"]}},
     {"name": "browser_type", "description": "Ввести текст в поле ввода.", "inputSchema": {"type": "object", "properties": {"selector": {"type": "string"}, "text": {"type": "string"}, "clear_first": {"type": "boolean", "default": True}, **TAB_PROPS}, "required": ["selector", "text"]}},
@@ -332,14 +416,19 @@ TOOLS = [
     {"name": "browser_getvalue", "description": "Получить value поля ввода.", "inputSchema": {"type": "object", "properties": {"selector": {"type": "string"}, **TAB_PROPS}, "required": ["selector"]}},
     {"name": "browser_wait", "description": "Дождаться появления элемента.", "inputSchema": {"type": "object", "properties": {"selector": {"type": "string"}, "timeout_ms": {"type": "integer", "default": 10000}, **TAB_PROPS}, "required": ["selector"]}},
     {"name": "browser_fill_form", "description": "Заполнить несколько полей формы разом.", "inputSchema": {"type": "object", "properties": {"fields": {"type": "object"}, "submit_selector": {"type": "string"}, **TAB_PROPS}, "required": ["fields"]}},
-    {"name": "browser_login", "description": "Авторизоваться на сайте и вернуть cookies после логина.", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}, "username_selector": {"type": "string"}, "password_selector": {"type": "string"}, "submit_selector": {"type": "string"}, "username": {"type": "string"}, "password": {"type": "string"}, "extra_fields": {"type": "object"}, "redact": {"type": "boolean", "default": False}, "tab_id": TAB_PROPS["tab_id"]}, "required": ["url", "username_selector", "password_selector", "submit_selector", "username", "password"]}},
-    {"name": "browser_tabs", "description": "Получить список всех открытых targets/вкладок.", "inputSchema": {"type": "object", "properties": {"include_non_page": {"type": "boolean", "default": False}}}},
-    {"name": "browser_newtab", "description": "Открыть новую вкладку с указанным URL.", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}, "wait_until_ready": {"type": "boolean", "default": True}}, "required": ["url"]}},
+    {"name": "browser_login", "description": "Авторизоваться на сайте и вернуть cookies после логина. По умолчанию cookies редактируются.", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}, "username_selector": {"type": "string"}, "password_selector": {"type": "string"}, "submit_selector": {"type": "string"}, "username": {"type": "string"}, "password": {"type": "string"}, "extra_fields": {"type": "object"}, "redact": {"type": "boolean", "default": True}, "tab_id": TAB_PROPS["tab_id"]}, "required": ["url", "username_selector", "password_selector", "submit_selector", "username", "password"]}},
+    {"name": "browser_tabs", "description": "Получить список targets/вкладок. webSocketDebuggerUrl скрыт без include_debug_url=true.", "inputSchema": {"type": "object", "properties": {"include_non_page": {"type": "boolean", "default": False}, "include_debug_url": {"type": "boolean", "default": False}}}},
+    {"name": "browser_newtab", "description": "Открыть новую вкладку с указанным URL. webSocketDebuggerUrl скрыт без include_debug_url=true.", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}, "wait_until_ready": {"type": "boolean", "default": True}, "include_debug_url": {"type": "boolean", "default": False}}, "required": ["url"]}},
     {"name": "browser_closetab", "description": "Закрыть вкладку по ID или URL-фильтру.", "inputSchema": {"type": "object", "properties": {"tab_id": {"type": "string"}, "url_filter": {"type": "string"}}}},
     {"name": "browser_scroll", "description": "Прокрутить страницу.", "inputSchema": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["down", "up", "top", "bottom"]}, "selector": {"type": "string"}, "amount": {"type": "integer", "default": 500}, **TAB_PROPS}}},
-    {"name": "browser_pdf", "description": "Сохранить текущую страницу как PDF base64.", "inputSchema": {"type": "object", "properties": {**TAB_PROPS}}},
+    {"name": "browser_pdf", "description": "Сохранить текущую страницу как PDF base64; для GitHub/чатов лучше browser_pdf_file.", "inputSchema": {"type": "object", "properties": {**TAB_PROPS}}},
+    {"name": "browser_pdf_file", "description": "Сохранить текущую страницу как PDF-файл в BROWSER_ARTIFACT_DIR / Hermes document cache.", "inputSchema": {"type": "object", "properties": {"filename_prefix": {"type": "string", "default": "browser-page"}, **TAB_PROPS}}},
+    {"name": "browser_html_file", "description": "Сохранить текущий DOM HTML файлом для evidence/debug.", "inputSchema": {"type": "object", "properties": {"filename_prefix": {"type": "string", "default": "browser-page"}, **TAB_PROPS}}},
     {"name": "browser_health", "description": "Проверить CDP/браузер, версию MCP, вкладки и доступность автозапуска CDP.", "inputSchema": {"type": "object", "properties": {"autostart": {"type": "boolean", "default": True}}}},
     {"name": "browser_page_summary", "description": "Краткая структурная сводка страницы: title/url/text snippet/forms/links/buttons/inputs.", "inputSchema": {"type": "object", "properties": {"max_text": {"type": "integer", "default": 4000}, "max_items": {"type": "integer", "default": 30}, **TAB_PROPS}}},
+    {"name": "browser_snapshot", "description": "Сводный снимок страницы для агента: summary + elements + optional screenshot file.", "inputSchema": {"type": "object", "properties": {"max_text": {"type": "integer", "default": 4000}, "max_items": {"type": "integer", "default": 40}, "include_screenshot": {"type": "boolean", "default": True}, **TAB_PROPS}}},
+    {"name": "browser_network_log", "description": "Лёгкий CDP Network capture: XHR/fetch/API requests за короткое окно, без cookie/auth headers.", "inputSchema": {"type": "object", "properties": {"duration_ms": {"type": "integer", "default": 3000}, "reload": {"type": "boolean", "default": False}, "include_all": {"type": "boolean", "default": False}, "max_items": {"type": "integer", "default": 100}, **TAB_PROPS}}},
+    {"name": "browser_find_api_calls", "description": "Найти вероятные JSON/API вызовы страницы через CDP Network events.", "inputSchema": {"type": "object", "properties": {"duration_ms": {"type": "integer", "default": 3000}, "reload": {"type": "boolean", "default": True}, "max_items": {"type": "integer", "default": 60}, **TAB_PROPS}}},
     {"name": "browser_select", "description": "Выбрать option в select по value/label/index.", "inputSchema": {"type": "object", "properties": {"selector": {"type": "string"}, "value": {"type": "string"}, "label": {"type": "string"}, "index": {"type": "integer"}, **TAB_PROPS}, "required": ["selector"]}},
     {"name": "browser_elements", "description": "Найти видимые/интерактивные элементы и вернуть устойчивые CSS-селекторы, текст, роли и координаты.", "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector кандидатов; по умолчанию интерактивные элементы"}, "query": {"type": "string", "description": "Фильтр по тексту/placeholder/name/id"}, "kind": {"type": "string", "enum": ["all", "clickable", "input", "link", "button", "select"]}, "max_items": {"type": "integer", "default": 80}, "include_hidden": {"type": "boolean", "default": False}, **TAB_PROPS}}},
     {"name": "browser_click_text", "description": "Кликнуть по видимому элементу, найденному по тексту/aria-label/value/title без ручного CSS-селектора.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}, "selector": {"type": "string", "description": "CSS selector кандидатов"}, "exact": {"type": "boolean", "default": False}, "case_sensitive": {"type": "boolean", "default": False}, "index": {"type": "integer", "default": 0}, "wait_after_ms": {"type": "integer", "default": 300}, **TAB_PROPS}, "required": ["text"]}},
@@ -380,10 +469,23 @@ def handle_screenshot(args):
     return {"ok": True, "tab_id": tab.get("id"), "screenshot_base64": data, "bytes_estimate": len(data) * 3 // 4, "format": "png"}
 
 
+def handle_screenshot_file(args):
+    shot = handle_screenshot(args)
+    saved = _write_b64_artifact(args.get("filename_prefix", "browser-screenshot"), "png", shot.get("screenshot_base64", ""))
+    return {
+        "ok": True,
+        "tab_id": shot.get("tab_id"),
+        "path": saved["path"],
+        "bytes": saved["bytes"],
+        "media_hint": _media_hint("png"),
+        "full_page": bool(args.get("full_page", False)),
+    }
+
+
 def handle_cookies(args):
     tab = _get_tab(args)
     filt = args.get("url_filter", "")
-    redact = bool(args.get("redact", False))
+    redact = bool(args.get("redact", True))
     r = _safe_ws(tab, [
         {"method": "Network.getCookies", "_key": "cookies"},
         {"method": "Runtime.evaluate", "params": {"expression": "document.cookie", "returnByValue": True}, "_key": "doc_cookie"},
@@ -396,9 +498,13 @@ def handle_cookies(args):
     if filt:
         cookies = [c for c in cookies if filt.lower() in (c.get("domain", "") or "").lower()]
     doc_cookie = r.get("doc_cookie", {}).get("result", {}).get("value", "")
+    local_storage = json.loads(r.get("ls", {}).get("result", {}).get("value", "{}") or "{}")
+    session_storage = json.loads(r.get("ss", {}).get("result", {}).get("value", "{}") or "{}")
     if redact:
         cookies = [_redact_cookie(c) for c in cookies]
         doc_cookie = f"[redacted len={len(doc_cookie)}]"
+        local_storage = _redact_mapping(local_storage)
+        session_storage = _redact_mapping(session_storage)
     return {
         "ok": True,
         "tab_id": tab.get("id"),
@@ -406,21 +512,29 @@ def handle_cookies(args):
         "document_cookie": doc_cookie,
         "url": r.get("url", {}).get("result", {}).get("value", ""),
         "title": r.get("title", {}).get("result", {}).get("value", ""),
-        "localStorage": json.loads(r.get("ls", {}).get("result", {}).get("value", "{}") or "{}"),
-        "sessionStorage": json.loads(r.get("ss", {}).get("result", {}).get("value", "{}") or "{}"),
+        "localStorage": local_storage,
+        "sessionStorage": session_storage,
     }
 
 
 def handle_localstorage(args):
     tab = _get_tab(args)
     val = _eval(tab, _storage_json_expr("localStorage", args.get("key", "")), timeout=10).get("value", "{}")
-    return {"ok": True, "tab_id": tab.get("id"), "data": json.loads(val or "{}")}
+    data = json.loads(val or "{}")
+    redacted = bool(args.get("redact", True))
+    if redacted:
+        data = _redact_mapping(data)
+    return {"ok": True, "tab_id": tab.get("id"), "redacted": redacted, "data": data}
 
 
 def handle_sessionstorage(args):
     tab = _get_tab(args)
     val = _eval(tab, _storage_json_expr("sessionStorage", args.get("key", "")), timeout=10).get("value", "{}")
-    return {"ok": True, "tab_id": tab.get("id"), "data": json.loads(val or "{}")}
+    data = json.loads(val or "{}")
+    redacted = bool(args.get("redact", True))
+    if redacted:
+        data = _redact_mapping(data)
+    return {"ok": True, "tab_id": tab.get("id"), "redacted": redacted, "data": data}
 
 
 def handle_exec(args):
@@ -547,8 +661,9 @@ def handle_login(args):
 def handle_tabs(args):
     tabs = _http("GET", "/json") or []
     include_non_page = bool(args.get("include_non_page", False))
+    include_debug_url = bool(args.get("include_debug_url", False))
     selected = tabs if include_non_page else [t for t in tabs if t.get("type") == "page"]
-    return {"ok": True, "tabs": [{"id": t.get("id"), "url": t.get("url"), "title": t.get("title"), "type": t.get("type"), "webSocketDebuggerUrl": t.get("webSocketDebuggerUrl")} for t in selected], "count": len(selected), "total_targets": len(tabs)}
+    return {"ok": True, "tabs": [_public_tab(t, include_debug_url) for t in selected], "count": len(selected), "total_targets": len(tabs), "debug_urls_included": include_debug_url}
 
 
 def handle_newtab(args):
@@ -558,7 +673,10 @@ def handle_newtab(args):
         time.sleep(0.5)
         tab = _get_tab({"tab_id": tab.get("id")}) or tab
         _wait_ready(tab, min(TIMEOUT, 20))
-    return {"ok": True, "tab_id": tab.get("id"), "url": tab.get("url"), "title": tab.get("title"), "webSocketDebuggerUrl": tab.get("webSocketDebuggerUrl")}
+    result = {"ok": True, "tab_id": tab.get("id"), "url": tab.get("url"), "title": tab.get("title")}
+    if bool(args.get("include_debug_url", False)):
+        result["webSocketDebuggerUrl"] = tab.get("webSocketDebuggerUrl")
+    return result
 
 
 def handle_closetab(args):
@@ -600,6 +718,102 @@ def handle_pdf(args):
     r = _safe_ws(tab, [{"method": "Page.printToPDF", "params": {"format": "A4", "printBackground": True}, "_key": "pdf"}], timeout=TIMEOUT)
     data = r.get("pdf", {}).get("data", "")
     return {"ok": True, "tab_id": tab.get("id"), "pdf_base64": data, "bytes_estimate": len(data) * 3 // 4, "format": "pdf"}
+
+
+def handle_pdf_file(args):
+    pdf = handle_pdf(args)
+    saved = _write_b64_artifact(args.get("filename_prefix", "browser-page"), "pdf", pdf.get("pdf_base64", ""))
+    return {"ok": True, "tab_id": pdf.get("tab_id"), "path": saved["path"], "bytes": saved["bytes"], "media_hint": _media_hint("pdf")}
+
+
+def handle_html_file(args):
+    tab = _get_tab(args)
+    html = _eval(tab, "document.documentElement ? document.documentElement.outerHTML : ''", timeout=15).get("value", "")
+    saved = _write_text_artifact(args.get("filename_prefix", "browser-page"), "html", html)
+    title = _eval(tab, "document.title", timeout=10).get("value", "")
+    url = _eval(tab, "window.location.href", timeout=10).get("value", "")
+    return {"ok": True, "tab_id": tab.get("id"), "path": saved["path"], "bytes": saved["bytes"], "media_hint": _media_hint("html"), "url": url, "title": title}
+
+
+def _capture_network(tab: Dict[str, Any], duration_ms: int, reload_page: bool, include_all: bool, max_items: int) -> Dict[str, Any]:
+    ws_url = tab.get("webSocketDebuggerUrl")
+    if not ws_url:
+        raise RuntimeError("Tab has no webSocketDebuggerUrl")
+    duration_ms = max(250, min(int(duration_ms), 30000))
+    max_items = max(1, min(int(max_items), 1000))
+    requests: Dict[str, Dict[str, Any]] = {}
+    ws = websocket.create_connection(ws_url, timeout=max(TIMEOUT, int(duration_ms / 1000) + 5))
+    try:
+        cid = 1
+        ws.send(json.dumps({"id": cid, "method": "Network.enable", "params": {"maxTotalBufferSize": 5242880, "maxResourceBufferSize": 1048576}})); cid += 1
+        if reload_page:
+            ws.send(json.dumps({"id": cid, "method": "Page.reload", "params": {"ignoreCache": True}})); cid += 1
+        end = time.time() + duration_ms / 1000.0
+        while time.time() < end:
+            ws.settimeout(max(0.05, min(0.5, end - time.time())))
+            try:
+                msg = json.loads(ws.recv())
+            except websocket.WebSocketTimeoutException:
+                continue
+            except Exception:
+                break
+            method = msg.get("method")
+            params = msg.get("params", {})
+            rid = params.get("requestId")
+            if not rid:
+                continue
+            item = requests.setdefault(rid, {"request_id": rid})
+            if method == "Network.requestWillBeSent":
+                req = params.get("request", {})
+                item.update({
+                    "url": req.get("url", ""),
+                    "method": req.get("method", "GET"),
+                    "resource_type": params.get("type", ""),
+                    "initiator_type": (params.get("initiator") or {}).get("type", ""),
+                })
+            elif method == "Network.responseReceived":
+                resp = params.get("response", {})
+                item.update({
+                    "url": resp.get("url", item.get("url", "")),
+                    "resource_type": params.get("type", item.get("resource_type", "")),
+                    "status": resp.get("status"),
+                    "mime_type": resp.get("mimeType", ""),
+                    "from_cache": bool(resp.get("fromDiskCache") or resp.get("fromPrefetchCache")),
+                })
+            elif method == "Network.loadingFailed":
+                item.update({"failed": True, "error_text": params.get("errorText", ""), "resource_type": params.get("type", item.get("resource_type", ""))})
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+    rows = list(requests.values())
+    if not include_all:
+        rows = [r for r in rows if r.get("resource_type") in {"XHR", "Fetch"} or "json" in str(r.get("mime_type", "")).lower() or re.search(r"/api/|graphql|\.json(\?|$)", str(r.get("url", "")), re.I)]
+    rows = rows[:max_items]
+    return {"ok": True, "tab_id": tab.get("id"), "duration_ms": duration_ms, "count": len(rows), "requests": rows, "redacted": True}
+
+
+def handle_network_log(args):
+    tab = _get_tab(args)
+    return _capture_network(tab, int(args.get("duration_ms", 3000)), bool(args.get("reload", False)), bool(args.get("include_all", False)), int(args.get("max_items", 100)))
+
+
+def handle_find_api_calls(args):
+    tab = _get_tab(args)
+    data = _capture_network(tab, int(args.get("duration_ms", 3000)), bool(args.get("reload", True)), False, int(args.get("max_items", 60)))
+    api_calls = []
+    for item in data.get("requests", []):
+        url = str(item.get("url", ""))
+        score = 0
+        if item.get("resource_type") in {"XHR", "Fetch"}: score += 2
+        if "json" in str(item.get("mime_type", "")).lower(): score += 2
+        if re.search(r"/api/|graphql|\.json(\?|$)", url, re.I): score += 3
+        api_calls.append({**item, "api_score": score})
+    api_calls.sort(key=lambda x: x.get("api_score", 0), reverse=True)
+    data["api_calls"] = api_calls
+    return data
 
 
 def handle_health(args):
@@ -650,6 +864,36 @@ def handle_page_summary(args):
     """
     value = _eval(tab, expr, timeout=15).get("value", {})
     return {"ok": True, "tab_id": tab.get("id"), **(value or {})}
+
+
+def handle_snapshot(args):
+    tab = _get_tab(args)
+    base_args = {"tab_id": tab.get("id"), "max_text": int(args.get("max_text", 4000)), "max_items": int(args.get("max_items", 40))}
+    summary = handle_page_summary(base_args)
+    elements = handle_elements({"tab_id": tab.get("id"), "max_items": int(args.get("max_items", 40)), "kind": "all"})
+    result: Dict[str, Any] = {
+        "ok": True,
+        "tab_id": tab.get("id"),
+        "url": summary.get("url"),
+        "title": summary.get("title"),
+        "text": summary.get("text", ""),
+        "headings": summary.get("headings", []),
+        "links": summary.get("links", []),
+        "buttons": summary.get("buttons", []),
+        "inputs": summary.get("inputs", []),
+        "forms": summary.get("forms", []),
+        "elements": elements.get("elements", []),
+        "elements_count": elements.get("count", 0),
+    }
+    if bool(args.get("include_screenshot", True)):
+        try:
+            shot = handle_screenshot_file({"tab_id": tab.get("id"), "filename_prefix": "browser-snapshot", "full_page": False})
+            result["screenshot_path"] = shot.get("path")
+            result["screenshot_bytes"] = shot.get("bytes")
+            result["screenshot_media_hint"] = shot.get("media_hint")
+        except Exception as e:
+            result["screenshot_error"] = str(e)[:300]
+    return result
 
 
 def handle_select(args):
@@ -904,6 +1148,7 @@ def handle_batch(args):
 HANDLERS = {
     "browser_navigate": handle_navigate,
     "browser_screenshot": handle_screenshot,
+    "browser_screenshot_file": handle_screenshot_file,
     "browser_cookies": handle_cookies,
     "browser_localstorage": handle_localstorage,
     "browser_sessionstorage": handle_sessionstorage,
@@ -921,8 +1166,13 @@ HANDLERS = {
     "browser_closetab": handle_closetab,
     "browser_scroll": handle_scroll,
     "browser_pdf": handle_pdf,
+    "browser_pdf_file": handle_pdf_file,
+    "browser_html_file": handle_html_file,
     "browser_health": handle_health,
     "browser_page_summary": handle_page_summary,
+    "browser_snapshot": handle_snapshot,
+    "browser_network_log": handle_network_log,
+    "browser_find_api_calls": handle_find_api_calls,
     "browser_select": handle_select,
     "browser_elements": handle_elements,
     "browser_click_text": handle_click_text,

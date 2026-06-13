@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile
+        run: python -m py_compile server.py scripts/smoke_mcp.py scripts/make_release_export.py
+      - name: MCP smoke test
+        env:
+          BROWSER_AUTOSTART_CDP: '0'
+        run: python scripts/smoke_mcp.py ./server.py
+      - name: Clean export smoke test
+        run: |
+          python scripts/make_release_export.py --dst /tmp/browser-automation-mcp-export
+          python /tmp/browser-automation-mcp-export/scripts/smoke_mcp.py /tmp/browser-automation-mcp-export/server.py

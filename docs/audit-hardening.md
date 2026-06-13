@@ -1,119 +1,99 @@
-# Browser Automation MCP audit & hardening notes
+# Audit and Hardening Checklist
 
-Session-derived checklist for auditing/repairing a CDP-backed MCP browser server.
+Use this checklist before publishing or deploying the Browser Automation MCP server.
 
-## What to inspect in `server.py`
+## MCP protocol checks
 
-1. Confirm every advertised tool has a handler and is registered in `HANDLERS`.
-2. Check MCP JSON-RPC shapes:
-   - `initialize` returns protocolVersion, capabilities, serverInfo.
-   - `tools/list` returns `{tools: [...]}` with JSON schemas.
-   - `tools/call` returns `content: [{type: "text", text: ...}]`; prefer `isError: true` for tool-level failures instead of JSON-RPC `error` when possible.
-3. Audit CDP helper lifecycle:
-   - WebSocket must close on success and timeout.
-   - Join worker threads after close.
-   - `_safe_ws()` should actually retry; do not just refresh the tab and re-raise.
-   - Avoid mutating caller command dicts with transient `_id` fields.
-4. Audit JavaScript generation:
-   - Never interpolate CSS selectors or storage keys as `'{sel}'` / `'{key}'`.
-   - Use `json.dumps(sel)` / `json.dumps(key)` in Python before embedding in JS.
-   - Add `returnByValue: true` when handlers read `Runtime.evaluate.result.value`.
-   - Add `awaitPromise: true` for promise-based waits.
-5. Audit tab targeting:
-   - If all tools call `_get_tab()` with no id, they operate on the first page target and race with multi-tab workflows.
-   - Prefer optional `tab_id` / `url_filter` for all page-specific tools.
+- `initialize` returns `protocolVersion`, `capabilities`, and `serverInfo`.
+- `tools/list` returns all advertised tools.
+- Every tool in `TOOLS` has a matching entry in `HANDLERS`.
+- `tools/call` returns MCP `content: [{type: "text", text: "...json..."}]`.
+- Tool failures use `isError: true` with a bounded JSON error payload.
 
-## Common concrete bugs
-
-### `/json/close/{id}` is not JSON
-
-Chrome/Brave returns plain text from `/json/close/{id}`. If the shared HTTP helper always does `json.loads()`, `browser_closetab` may physically close the tab and still report:
-
-```text
-Expecting value: line 1 column 1 (char 0)
-```
-
-Fix with a `raw=True` path or tolerant JSON parsing:
-
-```python
-resp = urllib.request.urlopen(req, timeout=5).read()
-if raw:
-    return resp
-try:
-    return json.loads(resp)
-except json.JSONDecodeError:
-    return {"raw": resp.decode(errors="replace")}
-```
-
-Then call close as raw:
-
-```python
-_http("GET", f"/json/close/{tab_id}", raw=True)
-```
-
-### `browser_wait` returns a Promise object
-
-If the expression is `new Promise(...)` but `Runtime.evaluate` lacks `awaitPromise: True`, CDP returns a remote Promise object rather than the final boolean. Include:
-
-```python
-{"awaitPromise": True, "returnByValue": True}
-```
-
-### Selector/key injection
-
-Bad:
-
-```python
-f"document.querySelector('{sel}')"
-f"localStorage.getItem('{key}')"
-```
-
-Good:
-
-```python
-sel_js = json.dumps(sel)
-key_js = json.dumps(key)
-f"document.querySelector({sel_js})"
-f"localStorage.getItem({key_js})"
-```
-
-### WebSocket leak pattern
-
-If `_ws_cmd()` starts `WebSocketApp.run_forever()` in a daemon thread and only closes on timeout, success paths can leak connections/threads. Always close in `finally` and `join(timeout=1)`.
-
-## Browser/CDP infrastructure audit commands
-
-Run as the service owner when checking a user-level systemd unit:
+Smoke command:
 
 ```bash
-sudo -u Hermes XDG_RUNTIME_DIR=/run/user/$(id -u Hermes) systemctl --user status brave-cdp --no-pager
-sudo -u Hermes XDG_RUNTIME_DIR=/run/user/$(id -u Hermes) systemctl --user show brave-cdp -p ActiveState -p SubState -p NRestarts -p ExecMainPID
-sudo -u Hermes XDG_RUNTIME_DIR=/run/user/$(id -u Hermes) journalctl --user -u brave-cdp -n 30 --no-pager
-ss -tlnp | grep 9223
-curl -s http://127.0.0.1:9223/json/version
-curl -s http://127.0.0.1:9223/json
-ps -ef | grep -E 'Xvfb|brave|chromium|chrome' | grep -v grep
+python3 scripts/smoke_mcp.py ./server.py
 ```
 
-Important: running `systemctl --user status brave-cdp` as `root` can incorrectly say the unit does not exist if the unit belongs to `Hermes`.
+## CDP lifecycle checks
 
-## Security checks
+- WebSocket connections are closed in `finally` blocks.
+- `/json/close/{id}` is treated as plain text, not mandatory JSON.
+- Long waits use bounded timeouts.
+- Test tabs are closed after smoke/stress tests.
+- `tab_id` / `url_filter` are supported on page-specific tools to avoid multi-tab races.
 
-- Confirm CDP binds to `127.0.0.1`, not `0.0.0.0`.
-- `--remote-allow-origins=*` is tolerable for localhost-only CDP but should not be combined with public binding.
-- `/json` exposes target metadata; WebSocket CDP exposes cookies/localStorage/sessionStorage.
-- Redact cookie values and token-like storage keys in reports/logs.
-- Grep browser logs for `accountId|deviceId|sessionId|auth|token|bearer|password|cookie`, but expect benign hits from flags like `--password-store=basic`.
+## JavaScript generation checks
 
-## Stress-test recipe
+- CSS selectors and storage keys are embedded with JSON quoting, not raw string interpolation.
+- Promise-based waits use `awaitPromise: true`.
+- Tool outputs are bounded where practical.
 
-1. Snapshot existing `/json` targets.
-2. Open test tabs via `/json/new?<url>` or the MCP `browser_newtab` tool.
-3. For each tab, run:
-   - `Runtime.evaluate(document.body?.innerText.slice(0,5000))`
-   - `Page.captureScreenshot({format: "png"})`
-4. Verify non-empty text and screenshot base64.
-5. Close only created tabs; remember `/json/close` returns plain text.
-6. Re-check `/json` to ensure no test tabs remain.
+## Public-safe redaction checks
 
-Useful test URLs: Wildberries, GitHub, Google, Habr. Yandex may redirect to CAPTCHA; count that as browser/network success but note anti-bot friction.
+Defaults should be safe for public tooling:
+
+- `browser_cookies(redact=true)` by default.
+- `browser_login(redact=true)` by default.
+- `browser_localstorage(redact=true)` by default.
+- `browser_sessionstorage(redact=true)` by default.
+- `browser_tabs` hides `webSocketDebuggerUrl` without `include_debug_url=true`.
+- `browser_newtab` hides `webSocketDebuggerUrl` without `include_debug_url=true`.
+- Network tools do not return Cookie/Authorization headers.
+
+## CDP exposure checks
+
+CDP is powerful enough to read browser state. Keep it private:
+
+```bash
+curl -s http://127.0.0.1:9223/json/version
+```
+
+Confirm the browser is bound to localhost. Do not bind CDP to `0.0.0.0` on public hosts.
+
+## Repository publication checks
+
+Run from a clean export, not a dirty runtime profile:
+
+```bash
+python3 scripts/make_release_export.py --dst /tmp/browser-automation-mcp-export
+cd /tmp/browser-automation-mcp-export
+python3 -m py_compile server.py scripts/smoke_mcp.py scripts/make_release_export.py
+python3 scripts/smoke_mcp.py ./server.py
+```
+
+Secret scan example:
+
+```bash
+python3 - <<'PY'
+import re
+from pathlib import Path
+patterns = {
+    'private_key': re.compile(r'-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----'),
+    'bearer_literal': re.compile(r'Authorization:\s*Bearer\s+[A-Za-z0-9._~+/-]{20,}', re.I),
+    'token_assignment': re.compile(r"(?i)(api[_-]?key|token|password|secret)\s*=\s*['\"][^'\"]{16,}['\"]"),
+    'sk_key': re.compile(r'\bsk-[A-Za-z0-9]{20,}\b'),
+}
+findings = []
+for path in Path('.').rglob('*'):
+    if path.is_file() and '.git' not in path.parts:
+        text = path.read_text(errors='ignore')
+        for name, rx in patterns.items():
+            if rx.search(text):
+                findings.append((str(path), name))
+if findings:
+    raise SystemExit(f'possible secrets: {findings}')
+print('secret scan ok')
+PY
+```
+
+## Stress-test recipe with a live browser
+
+1. Record current tabs with `browser_tabs`.
+2. `browser_newtab` to `https://example.com`.
+3. Run `browser_snapshot`.
+4. Run `browser_screenshot_file`.
+5. Run `browser_find_api_calls` with a short duration.
+6. Close only the created tab.
+7. Verify no extra test tabs remain.

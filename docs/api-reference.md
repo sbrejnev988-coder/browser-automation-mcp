@@ -1,211 +1,308 @@
 # Browser Automation MCP — API Reference
 
-26 tools wrapping Chrome DevTools Protocol via WebSocket. All tools return JSON with `{ok: true, ...}`.
+Current server version: **1.4.0**. The server exposes **32 MCP tools** over stdio and controls Chrome/Chromium/Brave through Chrome DevTools Protocol (CDP).
 
-## browser_navigate
+All `tools/call` responses are MCP text content containing JSON. Tool-level failures return `isError: true` with a JSON payload.
 
-Navigate to URL. Auto-waits for DOM.
+## Common tab arguments
 
-```json
-// Request
-{"name": "browser_navigate", "arguments": {"url": "https://example.com"}}
-
-// Response
-{"ok": true, "url": "https://example.com/page", "title": "Page Title"}
-```
-
-## browser_screenshot
-
-Capture page as PNG base64.
+Most page tools accept:
 
 ```json
-// Request
-{"name": "browser_screenshot", "arguments": {"full_page": false}}
-
-// Response
-{"ok": true, "screenshot_base64": "iVBORw0KGgo...", "format": "png"}
-```
-
-## browser_cookies
-
-Extract all cookies, document.cookie, localStorage, sessionStorage.
-
-```json
-// Request
-{"name": "browser_cookies", "arguments": {"url_filter": "example.com"}}
-
-// Response
 {
-  "ok": true,
-  "cookies": [{"name": "session", "value": "abc123", "domain": ".example.com", "path": "/", "httpOnly": true, "secure": true, "sameSite": "Lax"}],
-  "document_cookie": "session=abc123; _ga=GA1.2.456...",
-  "url": "https://example.com/dashboard",
-  "title": "Dashboard",
-  "localStorage": {"token": "eyJ...", "theme": "dark"},
-  "sessionStorage": {"csrf": "xyz"}
+  "tab_id": "optional CDP target id",
+  "url_filter": "optional substring to select a tab by URL"
 }
 ```
 
-## browser_localstorage / browser_sessionstorage
+If neither is provided, the first non-DevTools page target is used, or a new `about:blank` page is created.
+
+## Observation tools
+
+### browser_health
+
+Checks MCP version, CDP reachability, browser version, and current page targets.
 
 ```json
-// All keys
-{"name": "browser_localstorage", "arguments": {}}
-// → {"ok": true, "data": {"token": "eyJ...", "theme": "dark", "lang": "ru"}}
-
-// Specific key
-{"name": "browser_localstorage", "arguments": {"key": "token"}}
-// → {"ok": true, "data": {"token": "eyJ..."}}
+{"name": "browser_health", "arguments": {"autostart": false}}
 ```
 
-## browser_exec
+### browser_tabs
 
-Execute JavaScript in page context.
+Lists targets/tabs. `webSocketDebuggerUrl` is hidden by default.
 
 ```json
-// Simple
+{"name": "browser_tabs", "arguments": {"include_non_page": false}}
+```
+
+To expose debug URLs in a trusted local environment:
+
+```json
+{"name": "browser_tabs", "arguments": {"include_debug_url": true}}
+```
+
+### browser_page_summary
+
+Returns bounded visible text and structural page lists.
+
+```json
+{"name": "browser_page_summary", "arguments": {"max_text": 4000, "max_items": 30}}
+```
+
+### browser_elements
+
+Discovers visible/interactive elements with stable selectors, text, roles, values, and rectangles.
+
+```json
+{"name": "browser_elements", "arguments": {"kind": "clickable", "query": "submit", "max_items": 20}}
+```
+
+Sensitive input values are redacted when type/name/id/placeholder looks like password/token/auth/session/cookie.
+
+### browser_snapshot
+
+Recommended first observation primitive for agents. Combines summary, interactive elements, and optional screenshot file.
+
+```json
+{"name": "browser_snapshot", "arguments": {"max_text": 4000, "max_items": 40, "include_screenshot": true}}
+```
+
+## Navigation and interaction tools
+
+### browser_navigate
+
+```json
+{"name": "browser_navigate", "arguments": {"url": "https://example.com", "wait_until_ready": true}}
+```
+
+### browser_newtab
+
+Opens a new tab. Debug URL hidden unless `include_debug_url=true`.
+
+```json
+{"name": "browser_newtab", "arguments": {"url": "https://example.com"}}
+```
+
+### browser_closetab
+
+```json
+{"name": "browser_closetab", "arguments": {"tab_id": "..."}}
+```
+
+or:
+
+```json
+{"name": "browser_closetab", "arguments": {"url_filter": "example.com"}}
+```
+
+### browser_click
+
+```json
+{"name": "browser_click", "arguments": {"selector": "button.primary"}}
+```
+
+### browser_click_text
+
+Clicks visible element by text/aria/value/title without hand-written CSS selectors.
+
+```json
+{"name": "browser_click_text", "arguments": {"text": "Submit", "exact": true}}
+```
+
+### browser_type
+
+```json
+{"name": "browser_type", "arguments": {"selector": "#email", "text": "user@example.com", "clear_first": true}}
+```
+
+### browser_wait
+
+Waits for CSS selector.
+
+```json
+{"name": "browser_wait", "arguments": {"selector": ".loaded", "timeout_ms": 10000}}
+```
+
+### browser_wait_text
+
+Waits for visible text inside body or a selected element.
+
+```json
+{"name": "browser_wait_text", "arguments": {"text": "Saved", "selector": "body", "timeout_ms": 10000}}
+```
+
+### browser_scroll
+
+```json
+{"name": "browser_scroll", "arguments": {"direction": "down", "amount": 800}}
+```
+
+Supported directions: `down`, `up`, `top`, `bottom`. Passing `selector` scrolls that element into view.
+
+### browser_select
+
+Selects an option by value, label substring, or index.
+
+```json
+{"name": "browser_select", "arguments": {"selector": "select[name=country]", "label": "Germany"}}
+```
+
+### browser_fill_form
+
+```json
+{"name": "browser_fill_form", "arguments": {"fields": {"#email": "user@example.com"}, "submit_selector": "button[type=submit]"}}
+```
+
+### browser_login
+
+Navigates, fills credentials, submits, then returns redacted cookies by default.
+
+```json
+{
+  "name": "browser_login",
+  "arguments": {
+    "url": "https://example.com/login",
+    "username_selector": "#email",
+    "password_selector": "#password",
+    "submit_selector": "button[type=submit]",
+    "username": "user@example.com",
+    "password": "example-password",
+    "redact": true
+  }
+}
+```
+
+### browser_batch
+
+Runs multiple browser actions sequentially in one MCP call. Nested `browser_batch` is rejected.
+
+```json
+{
+  "name": "browser_batch",
+  "arguments": {
+    "steps": [
+      {"tool": "browser_navigate", "arguments": {"url": "https://example.com"}},
+      {"tool": "browser_wait_text", "arguments": {"text": "Example Domain"}}
+    ],
+    "stop_on_error": true
+  }
+}
+```
+
+## DOM/data extraction tools
+
+### browser_exec
+
+Executes JavaScript and returns `Runtime.evaluate.result.value`.
+
+```json
 {"name": "browser_exec", "arguments": {"expression": "document.title"}}
-// → {"ok": true, "result": "Page Title", "type": "string"}
+```
 
-// JSON extraction
-{"name": "browser_exec", "arguments": {"expression": "JSON.stringify(Array.from(document.querySelectorAll('.product-card')).map(c => ({name: c.querySelector('.name')?.innerText, price: c.querySelector('.price')?.innerText})))"}}
-// → {"ok": true, "result": "[{\"name\":\"Item 1\",\"price\":\"100 ₽\"},...]", "type": "string"}
+For promises:
 
-// Async
+```json
 {"name": "browser_exec", "arguments": {"expression": "fetch('/api/data').then(r => r.json())", "await_promise": true}}
 ```
 
-## browser_click / browser_type
+### browser_gettext
 
 ```json
-// Click
-{"name": "browser_click", "arguments": {"selector": ".btn-primary"}}
-// → {"ok": true, "clicked": true, "tag": "BUTTON", "text": "Submit"}
-
-// Type
-{"name": "browser_type", "arguments": {"selector": "#email", "text": "user@example.com", "clear_first": true}}
-// → {"ok": true, "typed": true, "value": "user@example.com"}
+{"name": "browser_gettext", "arguments": {"selector": "body"}}
 ```
 
-## browser_gettext / browser_gethtml / browser_getvalue
+Set `all=true` for all matching elements.
+
+### browser_gethtml
 
 ```json
-// Single element text
-{"name": "browser_gettext", "arguments": {"selector": ".price"}}
-// → {"ok": true, "text": "1 234 ₽"}
-
-// All matching elements
-{"name": "browser_gettext", "arguments": {"selector": ".product-name", "all": true}}
-// → {"ok": true, "text": ["Product A", "Product B", "Product C"]}
-
-// HTML
 {"name": "browser_gethtml", "arguments": {"selector": "#content", "outer": true}}
-// → {"ok": true, "html": "<div id=\"content\">...</div>"}
-
-// Input value
-{"name": "browser_getvalue", "arguments": {"selector": "#email"}}
-// → {"ok": true, "value": "user@example.com"}
 ```
 
-## browser_wait
-
-Wait for element to appear.
+### browser_getvalue
 
 ```json
-{"name": "browser_wait", "arguments": {"selector": ".loaded", "timeout_ms": 15000}}
-// → {"ok": true, "found": true, "selector": ".loaded"}
+{"name": "browser_getvalue", "arguments": {"selector": "input[name=q]"}}
 ```
 
-## browser_elements / browser_click_text / browser_wait_text
+## Storage/session tools
 
-Agent-friendly DOM discovery and text-driven interaction. Added in MCP v1.3.0.
+### browser_cookies
+
+Extracts cookies, `document.cookie`, localStorage and sessionStorage. Redacted by default.
 
 ```json
-// Discover visible interactive elements and stable selectors
-{"name": "browser_elements", "arguments": {"kind": "clickable", "query": "submit", "max_items": 20}}
-// → {"ok": true, "count": 2, "elements": [{"selector": "#submit", "kind": "button", "text": "Submit", "rect": {"x": 10, "y": 20, "width": 80, "height": 32}}]}
-
-// Click without hand-writing CSS selectors
-{"name": "browser_click_text", "arguments": {"text": "Submit", "exact": true}}
-// → {"ok": true, "clicked": true, "text": "Submit", "tag": "BUTTON", "matches_count": 1}
-
-// Wait for user-visible text after navigation/clicks
-{"name": "browser_wait_text", "arguments": {"text": "Saved", "selector": "body", "timeout_ms": 10000}}
-// → {"ok": true, "found": true, "text": "Settings Saved"}
+{"name": "browser_cookies", "arguments": {"redact": true}}
 ```
 
-Notes:
-- `browser_elements` redacts sensitive input values when type/name/id/placeholder looks like password/token/auth/session/cookie.
-- Use `browser_elements` first when selectors are unknown, then `browser_click_text` for brittle/dynamic UIs.
+### browser_localstorage / browser_sessionstorage
 
-## browser_fill_form
-
-Fill multiple fields at once.
+Secret-like keys are redacted by default.
 
 ```json
-// Request
-{"name": "browser_fill_form", "arguments": {
-  "fields": {
-    "#email": "user@example.com",
-    "#password": "secret123",
-    "#name": "John"
-  },
-  "submit_selector": "#submit"  // optional: click submit after filling
-}}
-// → {"ok": true, "fields_filled": 3, "submitted": true, "details": {...}}
+{"name": "browser_localstorage", "arguments": {"redact": true}}
 ```
 
-## browser_login
-
-Full login flow: navigate → wait for form → fill credentials → submit → return cookies.
-
 ```json
-// Request
-{"name": "browser_login", "arguments": {
-  "url": "https://example.com/login",
-  "username_selector": "#email",
-  "password_selector": "#password",
-  "submit_selector": "button[type='submit']",
-  "username": "user@example.com",
-  "password": "secret123",
-  "extra_fields": {"#captcha": "manual-input"}  // optional
-}}
-// → {"ok": true, "login_completed": true, "cookies": [...], "url": "..."}
+{"name": "browser_sessionstorage", "arguments": {"key": "theme", "redact": true}}
 ```
 
-## browser_tabs / browser_newtab / browser_closetab
+## Artifact tools
+
+### browser_screenshot
+
+Returns base64 PNG. Prefer `browser_screenshot_file` for chat/CI/public automation.
 
 ```json
-// List tabs
-{"name": "browser_tabs", "arguments": {}}
-// → {"ok": true, "tabs": [{"id": "ABC123...", "url": "...", "title": "...", "type": "page"}], "count": 5}
-
-// New tab
-{"name": "browser_newtab", "arguments": {"url": "https://example.com"}}
-// → {"ok": true, "tab_id": "DEF456..."}
-
-// Close tab
-{"name": "browser_closetab", "arguments": {"url_filter": "example.com"}}
-// → {"ok": true, "closed": "DEF456..."}
+{"name": "browser_screenshot", "arguments": {"full_page": false}}
 ```
 
-## browser_scroll / browser_pdf
+### browser_screenshot_file
+
+Saves PNG under `BROWSER_ARTIFACT_DIR` and returns `{path, bytes, media_hint}`.
 
 ```json
-// Scroll
-{"name": "browser_scroll", "arguments": {"direction": "down", "amount": 500}}
-// → {"ok": true, "result": "scrolled down 500px"}
-{"name": "browser_scroll", "arguments": {"direction": "bottom"}}
-{"name": "browser_scroll", "arguments": {"selector": "#footer"}}
+{"name": "browser_screenshot_file", "arguments": {"full_page": true, "filename_prefix": "evidence"}}
+```
 
-// PDF
+### browser_pdf
+
+Returns base64 PDF. Prefer `browser_pdf_file` for most workflows.
+
+```json
 {"name": "browser_pdf", "arguments": {}}
-// → {"ok": true, "pdf_base64": "JVBERi0xLjQK...", "format": "pdf"}
 ```
 
-## Error Responses
+### browser_pdf_file
 
 ```json
-{"ok": true, "error": "element not found: .nonexistent"}
-{"ok": false, "error": "timeout waiting for .slow-element"}
+{"name": "browser_pdf_file", "arguments": {"filename_prefix": "page"}}
 ```
+
+### browser_html_file
+
+Saves current `document.documentElement.outerHTML`.
+
+```json
+{"name": "browser_html_file", "arguments": {"filename_prefix": "page"}}
+```
+
+## Network/API discovery tools
+
+### browser_network_log
+
+Captures CDP Network events for a bounded time window. By default returns XHR/fetch/JSON-like calls only and does not include Cookie/Authorization headers.
+
+```json
+{"name": "browser_network_log", "arguments": {"duration_ms": 3000, "reload": false, "include_all": false, "max_items": 100}}
+```
+
+### browser_find_api_calls
+
+Reloads by default and scores likely API endpoints.
+
+```json
+{"name": "browser_find_api_calls", "arguments": {"duration_ms": 3000, "reload": true, "max_items": 60}}
+```
+
+Each returned API candidate includes an `api_score` based on resource type, JSON MIME type, and URL pattern.
