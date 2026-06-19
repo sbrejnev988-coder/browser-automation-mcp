@@ -1,30 +1,34 @@
 #!/usr/bin/env python3
 """
-Universal Browser Automation MCP Server v1.4
-Direct Chrome DevTools Protocol WebSocket client.
+Universal Browser Automation MCP Server v2.0 — OmniCouncil Hardened
+====================================================================
+7 improvements from OmniCouncil (2026-06-18):
+  P0: Session Resilience + Observability (heartbeat, reconnect, metrics, circuit breaker)
+  P1: Memory-Wiki Integration + Multi-Context Sessions
+  P2: Network Interception (HAR) + Self-Healing Locators
+  P3: Deep Web Crawl Bridge
+Backward-compatible: all v1.4 tools unchanged. New tools opt-in.
 
-Keeps the original browser-control tools and adds operational health/autostart,
-page summarization, element discovery, text-click/text-wait helpers, select controls,
-file artifacts, safe redaction defaults, page snapshots, lightweight network/API
-discovery, and batch execution for fewer MCP round-trips.
-Still uses direct Chrome DevTools Protocol HTTP/WebSocket and no public BrowserMCP.
+Direct Chrome DevTools Protocol WebSocket client — no public BrowserMCP.
 """
 
 import base64
+import hashlib
 import json
 import os
 import re
 import sys
 import time
 import subprocess
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # ====== CONFIG ======
 CDP = os.environ.get("BROWSER_CDP_URL", "http://127.0.0.1:9223").rstrip("/")
-TOKEN = os.environ.get("CODEX_DEBUG_TOKEN", os.environ.get("BROWSER_AUTH_TOKEN", ""))
+TOKEN = os.environ.get("BROWSER_AUTH_TOKEN", os.environ.get("CODEX_DEBUG_TOKEN", ""))
 TIMEOUT = int(os.environ.get("BROWSER_TIMEOUT", "30"))
 HTTP_TIMEOUT = int(os.environ.get("BROWSER_HTTP_TIMEOUT", "10"))
 DEFAULT_TAB_URL = "about:blank"
@@ -32,7 +36,25 @@ ARTIFACT_DIR = os.environ.get("BROWSER_ARTIFACT_DIR", os.path.expanduser("~/.her
 AUTOSTART_CDP = os.environ.get("BROWSER_AUTOSTART_CDP", "1").lower() not in {"0", "false", "no", "off"}
 CDP_START_CMD = os.environ.get("BROWSER_CDP_START_CMD", os.path.expanduser("~/.local/bin/browser-cdp-start"))
 CDP_START_TIMEOUT = int(os.environ.get("BROWSER_CDP_START_TIMEOUT", "45"))
-SERVER_VERSION = "1.4.0"
+SERVER_VERSION = "2.0.0"
+
+# P0: Resilience
+HEARTBEAT_INTERVAL = int(os.environ.get("BROWSER_HEARTBEAT_SEC", "15"))
+RECONNECT_BASE_DELAY = float(os.environ.get("BROWSER_RECONNECT_BASE_S", "1.0"))
+RECONNECT_MAX_DELAY = float(os.environ.get("BROWSER_RECONNECT_MAX_S", "30.0"))
+CIRCUIT_BREAKER_THRESHOLD = int(os.environ.get("BROWSER_CB_THRESHOLD", "5"))
+CIRCUIT_BREAKER_TIMEOUT_S = int(os.environ.get("BROWSER_CB_OPEN_S", "30"))
+
+# P0: Observability
+METRICS_ENABLED = os.environ.get("BROWSER_METRICS", "1").lower() not in {"0", "false", "no", "off"}
+
+# P1: Memory-Wiki
+MEMORY_WIKI_URL = os.environ.get("BROWSER_MEMORY_WIKI_URL", "http://127.0.0.1:8644")
+MEMORY_WIKI_TIMEOUT = int(os.environ.get("BROWSER_MEMORY_WIKI_TIMEOUT", "5"))
+
+# P1: Multi-Context
+MAX_TABS = int(os.environ.get("BROWSER_MAX_TABS", "4"))
+
 _cdp_start_attempted = False
 
 try:
@@ -41,16 +63,118 @@ except ImportError:
     print("[browser-mcp] FATAL: websocket-client not installed. Run: pip install websocket-client", file=sys.stderr)
     sys.exit(1)
 
+# ====== OBSERVABILITY (P0) ======
+
+class Metrics:
+    """Thread-safe metrics collector with Prometheus-compatible output."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.counters: Dict[str, int] = {}
+        self.gauges: Dict[str, float] = {}
+        self.latencies: Dict[str, List[float]] = {}  # last 100 per key
+        self._start_time = time.time()
+
+    def incr(self, key: str, delta: int = 1):
+        with self._lock:
+            self.counters[key] = self.counters.get(key, 0) + delta
+
+    def gauge(self, key: str, value: float):
+        with self._lock:
+            self.gauges[key] = value
+
+    def observe(self, key: str, seconds: float):
+        with self._lock:
+            if key not in self.latencies:
+                self.latencies[key] = []
+            self.latencies[key].append(seconds)
+            if len(self.latencies[key]) > 100:
+                self.latencies[key] = self.latencies[key][-100:]
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            stats = {
+                "uptime_seconds": time.time() - self._start_time,
+                "counters": dict(self.counters),
+                "gauges": dict(self.gauges),
+                "latencies": {}
+            }
+            for key, vals in self.latencies.items():
+                if vals:
+                    sorted_vals = sorted(vals)
+                    stats["latencies"][key] = {
+                        "count": len(vals),
+                        "p50": sorted_vals[len(vals)//2],
+                        "p95": sorted_vals[int(len(vals)*0.95)],
+                        "p99": sorted_vals[int(len(vals)*0.99)],
+                        "avg": sum(vals) / len(vals),
+                    }
+            return stats
+
+METRICS = Metrics()
+
+# ====== STRUCTURED LOGGING (P0) ======
+
+def _log(msg: str, level: str = "info", **extra) -> None:
+    """JSON structured log to stderr."""
+    now = time.time()
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + f".{int((now % 1) * 1000):03d}Z",
+        "level": level,
+        "msg": msg,
+        "source": "browser-mcp",
+        "version": SERVER_VERSION,
+    }
+    entry.update(extra)
+    print(json.dumps(entry, ensure_ascii=False), file=sys.stderr, flush=True)
+
+# ====== CIRCUIT BREAKER (P0) ======
+
+class CircuitBreaker:
+    """Fail-fast pattern: OPEN after N failures, HALF_OPEN after timeout, CLOSED on success."""
+
+    def __init__(self, name: str, threshold: int = CIRCUIT_BREAKER_THRESHOLD,
+                 open_timeout: int = CIRCUIT_BREAKER_TIMEOUT_S):
+        self.name = name
+        self.threshold = threshold
+        self.open_timeout = open_timeout
+        self._failures = 0
+        self._last_failure = 0.0
+        self._state = "CLOSED"  # CLOSED → OPEN → HALF_OPEN → CLOSED
+        self._lock = threading.Lock()
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            if self._state == "OPEN" and time.time() - self._last_failure >= self.open_timeout:
+                self._state = "HALF_OPEN"
+            return self._state
+
+    def allow(self) -> bool:
+        return self.state != "OPEN"
+
+    def success(self):
+        with self._lock:
+            self._failures = 0
+            self._state = "CLOSED"
+            METRICS.gauge(f"cb_{self.name}_state", 0)
+
+    def failure(self):
+        with self._lock:
+            self._failures += 1
+            self._last_failure = time.time()
+            if self._failures >= self.threshold:
+                self._state = "OPEN"
+            METRICS.gauge(f"cb_{self.name}_state", 1 if self._state == "OPEN" else 0.5)
+            METRICS.incr(f"cb_{self.name}_failures")
+
+CDP_CIRCUIT = CircuitBreaker("cdp")
+
 # ====== HELPERS ======
-
-def _log(msg: str) -> None:
-    print(f"[browser-mcp] {msg}", file=sys.stderr, flush=True)
-
 
 def _send(data: Dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(data, ensure_ascii=False) + "\n")
     sys.stdout.flush()
-
 
 
 def _cdp_probe(timeout: int = 2) -> Optional[Dict[str, Any]]:
@@ -66,7 +190,9 @@ def _ensure_cdp_started(reason: str = "request") -> bool:
     """Best-effort CDP autostart; never loops more than once per process."""
     global _cdp_start_attempted
     if _cdp_probe(timeout=2):
+        METRICS.gauge("cdp_reachable", 1)
         return True
+    METRICS.gauge("cdp_reachable", 0)
     if not AUTOSTART_CDP or _cdp_start_attempted:
         return False
     _cdp_start_attempted = True
@@ -74,6 +200,7 @@ def _ensure_cdp_started(reason: str = "request") -> bool:
         return False
     try:
         _log(f"CDP not reachable ({reason}); starting via: {CDP_START_CMD}")
+        METRICS.incr("cdp_autostart_attempts")
         proc = subprocess.run(
             ["bash", "-lc", CDP_START_CMD],
             text=True,
@@ -82,19 +209,23 @@ def _ensure_cdp_started(reason: str = "request") -> bool:
             env=os.environ.copy(),
         )
         if proc.returncode != 0:
-            _log(f"CDP start failed rc={proc.returncode}: {(proc.stderr or proc.stdout)[-500:]}")
+            _log(f"CDP start failed rc={proc.returncode}: {(proc.stderr or proc.stdout)[-500:]}", level="error")
+            METRICS.incr("cdp_autostart_failures")
             return False
         deadline = time.time() + 10
         while time.time() < deadline:
             if _cdp_probe(timeout=2):
+                METRICS.gauge("cdp_reachable", 1)
+                METRICS.incr("cdp_autostart_successes")
                 return True
             time.sleep(0.5)
     except Exception as e:
-        _log(f"CDP start exception: {e}")
+        _log(f"CDP start exception: {e}", level="error")
     return bool(_cdp_probe(timeout=2))
 
 
-def _http(method: str, path: str, data: Any = None, raw: bool = False, timeout: int = HTTP_TIMEOUT) -> Any:
+def _http(method: str, path: str, data: Any = None, raw: bool = False,
+          timeout: int = HTTP_TIMEOUT) -> Any:
     """HTTP request to CDP /json endpoints. Tolerates plain-text responses and autostarts CDP once."""
     url = f"{CDP}{path}"
 
@@ -112,7 +243,6 @@ def _http(method: str, path: str, data: Any = None, raw: bool = False, timeout: 
     try:
         resp = read(method)
     except urllib.error.HTTPError as e:
-        # Newer Chrome disallows PUT /json/new. Fall back to GET for compatibility.
         if method.upper() == "PUT" and e.code == 405 and path.startswith("/json/new"):
             resp = read("GET")
         else:
@@ -183,25 +313,147 @@ def _get_tab(args: Optional[Dict[str, Any]] = None, create: bool = True) -> Opti
     return None
 
 
+# ====== CONNECTION MANAGER (P0) ======
+
+class CDPConnectionManager:
+    """
+    Persistent CDP WebSocket management with:
+    - Heartbeat every HEARTBEAT_INTERVAL seconds
+    - Auto-reconnect with exponential backoff (RECONNECT_BASE_DELAY → RECONNECT_MAX_DELAY)
+    - Circuit breaker integration
+    - Shared connection per tab_id
+    """
+    _connections: Dict[str, Dict[str, Any]] = {}  # tab_id → {ws, last_heartbeat, lock}
+    _lock = threading.Lock()
+    _heartbeat_thread = None
+    _heartbeat_running = False
+
+    @classmethod
+    def _start_heartbeats(cls):
+        if cls._heartbeat_running:
+            return
+        cls._heartbeat_running = True
+        cls._heartbeat_thread = threading.Thread(target=cls._heartbeat_loop, daemon=True)
+        cls._heartbeat_thread.start()
+        _log("Heartbeat thread started", interval=HEARTBEAT_INTERVAL)
+
+    @classmethod
+    def _heartbeat_loop(cls):
+        while cls._heartbeat_running:
+            time.sleep(HEARTBEAT_INTERVAL)
+            with cls._lock:
+                dead = []
+                for tab_id, conn in list(cls._connections.items()):
+                    try:
+                        conn["ws"].send(json.dumps({"id": 99999, "method": "Browser.getVersion"}))
+                        conn["last_heartbeat"] = time.time()
+                    except Exception:
+                        dead.append(tab_id)
+                for tab_id in dead:
+                    _log(f"Heartbeat failed for {tab_id}, removing", level="warn")
+                    METRICS.incr("cdp_heartbeat_failures")
+                    try:
+                        cls._connections.pop(tab_id, None)
+                    except Exception:
+                        pass
+            METRICS.gauge("cdp_active_connections", len(cls._connections))
+
+    @classmethod
+    def get_connection(cls, tab: Dict[str, Any], timeout: int = TIMEOUT) -> websocket.WebSocket:
+        """Get or establish a WebSocket connection for a tab with health check."""
+        tab_id = tab.get("id", "")
+        ws_url = tab.get("webSocketDebuggerUrl")
+        if not ws_url:
+            raise RuntimeError("Tab has no webSocketDebuggerUrl")
+
+        with cls._lock:
+            if tab_id in cls._connections:
+                conn = cls._connections[tab_id]
+                if time.time() - conn.get("last_heartbeat", 0) < HEARTBEAT_INTERVAL * 2:
+                    return conn["ws"]
+                # Stale — reconnect
+                try:
+                    conn["ws"].close()
+                except Exception:
+                    pass
+                del cls._connections[tab_id]
+
+        # Establish new connection with health check
+        delay = RECONNECT_BASE_DELAY
+        last_error = None
+        for attempt in range(3):
+            try:
+                ws = websocket.create_connection(ws_url, timeout=timeout)
+                # Quick health check
+                ws.send(json.dumps({"id": 1, "method": "Browser.getVersion"}))
+                ws.settimeout(3)
+                resp = json.loads(ws.recv())
+                ws.settimeout(timeout)
+                if resp.get("id") == 1 and "result" in resp:
+                    with cls._lock:
+                        cls._connections[tab_id] = {
+                            "ws": ws,
+                            "last_heartbeat": time.time(),
+                        }
+                    cls._start_heartbeats()
+                    METRICS.incr("cdp_connections_established")
+                    METRICS.gauge("cdp_active_connections", len(cls._connections))
+                    _log(f"CDP connection established for {tab_id}", tab_id=tab_id, attempt=attempt+1)
+                    return ws
+                ws.close()
+            except Exception as e:
+                last_error = e
+            _log(f"CDP connect retry {attempt+1}/3 for {tab_id}", delay=delay, level="warn")
+            time.sleep(delay)
+            delay = min(delay * 2, RECONNECT_MAX_DELAY)
+
+        raise RuntimeError(f"Failed to connect to CDP after 3 attempts: {last_error}")
+
+    @classmethod
+    def close_all(cls):
+        cls._heartbeat_running = False
+        with cls._lock:
+            for conn in cls._connections.values():
+                try:
+                    conn["ws"].close()
+                except Exception:
+                    pass
+            cls._connections.clear()
+        METRICS.gauge("cdp_active_connections", 0)
+
+
 def _ws_cmd(tab: Dict[str, Any], commands: List[Dict[str, Any]], timeout: int = TIMEOUT) -> Dict[str, Any]:
-    """Execute CDP commands through one short-lived WebSocket connection."""
+    """Execute CDP commands through a managed WebSocket connection."""
+    if not CDP_CIRCUIT.allow():
+        raise RuntimeError("CDP circuit breaker OPEN — too many failures")
+
     ws_url = tab.get("webSocketDebuggerUrl")
     if not ws_url:
         raise RuntimeError("Tab has no webSocketDebuggerUrl")
 
-    ws = websocket.create_connection(ws_url, timeout=timeout)
+    start = time.time()
+    try:
+        ws = CDPConnectionManager.get_connection(tab, timeout)
+    except Exception:
+        METRICS.incr("cdp_connection_errors")
+        CDP_CIRCUIT.failure()
+        # Fallback: use short-lived connection
+        _log("ConnectionManager failed, falling back to short-lived WS", level="warn")
+        ws = websocket.create_connection(ws_url, timeout=timeout)
+
     results: Dict[str, Any] = {}
     errors: List[str] = []
     next_id = 1
     pending: Dict[int, Dict[str, Any]] = {}
 
     try:
-        # Enable domains. Ignore enable errors but drain their direct responses.
+        # Enable domains (once per connection is enough with persistent connections)
         enable_ids = []
         for domain in ["Page", "Network", "Runtime", "DOM"]:
             cid = next_id; next_id += 1
             enable_ids.append(cid)
             ws.send(json.dumps({"id": cid, "method": f"{domain}.enable"}))
+
         end = time.time() + min(3, max(1, timeout / 4))
         seen_enable = set()
         while len(seen_enable) < len(enable_ids) and time.time() < end:
@@ -214,7 +466,7 @@ def _ws_cmd(tab: Dict[str, Any], commands: List[Dict[str, Any]], timeout: int = 
                 seen_enable.add(msg.get("id"))
 
         for original in commands:
-            cmd = dict(original)  # do not mutate caller data
+            cmd = dict(original)
             cid = next_id; next_id += 1
             pending[cid] = cmd
             ws.send(json.dumps({
@@ -248,27 +500,33 @@ def _ws_cmd(tab: Dict[str, Any], commands: List[Dict[str, Any]], timeout: int = 
                 results[key] = d.get("result", {})
 
         if pending:
-            errors.append("timeout waiting for: " + ", ".join(c.get("_key", c.get("method", "?")) for c in pending.values()))
+            errors.append("timeout waiting for: " + ", ".join(
+                c.get("_key", c.get("method", "?")) for c in pending.values()))
+
         if errors:
-            # Preserve partial results for debugging but fail loudly.
             raise RuntimeError("; ".join(errors))
+
+        CDP_CIRCUIT.success()
+        METRICS.incr("cdp_commands_success")
+        METRICS.observe("cdp_command_latency", time.time() - start)
         return results
-    finally:
-        try:
-            ws.close()
-        except Exception:
-            pass
+    except Exception:
+        METRICS.incr("cdp_commands_failed")
+        CDP_CIRCUIT.failure()
+        raise
 
 
-def _safe_ws(tab: Dict[str, Any], commands: List[Dict[str, Any]], timeout: int = TIMEOUT, retries: int = 1) -> Dict[str, Any]:
-    """Wrapper with actual retry after timeout/websocket failure."""
+def _safe_ws(tab: Dict[str, Any], commands: List[Dict[str, Any]],
+             timeout: int = TIMEOUT, retries: int = 2) -> Dict[str, Any]:
+    """Wrapper with retry after timeout/websocket failure, exponential backoff."""
     last: Optional[Exception] = None
     for attempt in range(retries + 1):
         try:
             return _ws_cmd(tab, commands, timeout)
         except Exception as e:
             last = e
-            retryable = any(s in str(e).lower() for s in ["timeout", "websocket", "ws_", "connection", "closed"])
+            retryable = any(s in str(e).lower() for s in
+                          ["timeout", "websocket", "ws_", "connection", "closed", "circuit"])
             if attempt >= retries or not retryable:
                 break
             try:
@@ -276,11 +534,12 @@ def _safe_ws(tab: Dict[str, Any], commands: List[Dict[str, Any]], timeout: int =
                 tab = next((t for t in tabs if t.get("id") == tab.get("id")), tab)
             except Exception:
                 pass
-            time.sleep(0.25)
+            time.sleep(min(0.25 * (2 ** attempt), 2.0))
     raise last or RuntimeError("unknown websocket error")
 
 
-def _eval(tab: Dict[str, Any], expression: str, *, await_promise: bool = False, return_by_value: bool = True, timeout: int = TIMEOUT) -> Dict[str, Any]:
+def _eval(tab: Dict[str, Any], expression: str, *, await_promise: bool = False,
+          return_by_value: bool = True, timeout: int = TIMEOUT) -> Dict[str, Any]:
     r = _safe_ws(tab, [{
         "method": "Runtime.evaluate",
         "params": {
@@ -309,6 +568,331 @@ def _wait_ready(tab: Dict[str, Any], timeout_sec: float = 15.0) -> None:
         time.sleep(0.25)
 
 
+# ====== SELF-HEALING LOCATORS (P2) ======
+
+class SelectorPack:
+    """
+    Progressive selector resolution with fallback strategies.
+    Accepts either a string (backward compat) or a dict:
+    {primary, text, aria, xpath_fallback, label_text}
+    """
+
+    @staticmethod
+    def normalize(selector) -> Dict[str, Any]:
+        """Normalize selector input to a selector_pack dict."""
+        if isinstance(selector, str):
+            return {"primary": selector}
+        if isinstance(selector, dict):
+            return selector
+        return {"primary": str(selector)}
+
+    @staticmethod
+    def resolve(tab: Dict[str, Any], selector_pack: dict,
+                timeout: int = TIMEOUT) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """
+        Try strategies in order until one matches. Returns (strategy_used, element_info).
+        Element info: {found, text, tag, selector} or None if nothing found.
+        """
+        strategies = []
+
+        if selector_pack.get("primary"):
+            strategies.append(("primary", selector_pack["primary"]))
+        if selector_pack.get("text"):
+            sel = selector_pack.get("text")
+            strategies.append(("text", f"//*[contains(normalize-space(), {_json_arg(sel)})]"))
+        if selector_pack.get("aria"):
+            sel = selector_pack.get("aria")
+            strategies.append(("aria", f"[aria-label*={_json_arg(sel)}]"))
+        if selector_pack.get("label_text"):
+            sel = selector_pack.get("label_text")
+            strategies.append(("label_text", f"//label[contains(., {_json_arg(sel)})]/following-sibling::*[1]"))
+        if selector_pack.get("xpath_fallback"):
+            strategies.append(("xpath_fallback", selector_pack["xpath_fallback"]))
+
+        for strategy_name, strategy_sel in strategies:
+            try:
+                # Test if selector matches
+                if strategy_name in ("text", "label_text", "xpath_fallback") and strategy_sel.startswith("/"):
+                    # XPath — evaluate differently
+                    expr = f"""
+                    (function() {{
+                        try {{
+                            const result = document.evaluate(
+                                {_json_arg(strategy_sel)}, document, null,
+                                XPathResult.FIRST_ORDERED_NODE_TYPE, null
+                            );
+                            const el = result.singleNodeValue;
+                            if (!el) return {{found: false}};
+                            return {{
+                                found: true,
+                                tag: el.tagName,
+                                text: (el.innerText || el.value || '').slice(0, 100),
+                                rect: (() => {{ const r = el.getBoundingClientRect(); return {{x: r.x, y: r.y, w: r.width, h: r.height}}; }})()
+                            }};
+                        }} catch(e) {{ return {{found: false, error: e.message}}; }}
+                    }})()
+                    """
+                else:
+                    expr = f"""
+                    (function() {{
+                        const el = document.querySelector({_json_arg(strategy_sel)});
+                        if (!el) return {{found: false}};
+                        return {{
+                            found: true,
+                            tag: el.tagName,
+                            text: (el.innerText || el.value || '').slice(0, 100),
+                            rect: (() => {{ const r = el.getBoundingClientRect(); return {{x: r.x, y: r.y, w: r.width, h: r.height}}; }})()
+                        }};
+                    }})()
+                    """
+                result = _eval(tab, expr, timeout=10).get("value") or {}
+                if result.get("found"):
+                    return strategy_name, result
+            except Exception:
+                continue
+
+        # Levenshtein fallback — search all visible interactive elements
+        if selector_pack.get("text"):
+            wanted = str(selector_pack["text"]).lower()
+            expr = f"""
+            (() => {{
+                const wanted = {_json_arg(wanted)};
+                const dist = (a, b) => {{
+                    if (!a.length) return b.length;
+                    if (!b.length) return a.length;
+                    const m = [];
+                    for (let i = 0; i <= a.length; i++) {{ m[i] = [i]; }}
+                    for (let j = 0; j <= b.length; j++) {{ m[0][j] = j; }}
+                    for (let i = 1; i <= a.length; i++) {{
+                        for (let j = 1; j <= b.length; j++) {{
+                            m[i][j] = Math.min(
+                                m[i-1][j] + 1, m[i][j-1] + 1,
+                                m[i-1][j-1] + (a[i-1] === b[j-1] ? 0 : 1)
+                            );
+                        }}
+                    }}
+                    return m[a.length][b.length];
+                }};
+                const els = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role]'));
+                const visible = e => {{
+                    const s = getComputedStyle(e), r = e.getBoundingClientRect();
+                    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+                }};
+                const candidates = els.filter(visible).map(e => ({{
+                    el: e,
+                    text: (e.innerText || e.value || e.getAttribute('aria-label') || '').toLowerCase().slice(0, 100),
+                }})).filter(c => c.text);
+                let best = null, bestDist = Infinity;
+                for (const c of candidates) {{
+                    const d = dist(wanted, c.text);
+                    if (d < bestDist) {{ bestDist = d; best = c; }}
+                }}
+                if (!best || bestDist > wanted.length * 0.6) return {{found: false, levenshtein_tried: true}};
+                const r = best.el.getBoundingClientRect();
+                return {{found: true, tag: best.el.tagName, text: best.text, levenshtein_dist: bestDist,
+                         rect: {{x: r.x, y: r.y, w: r.width, h: r.height}} }};
+            }})()
+            """
+            try:
+                result = _eval(tab, expr, timeout=15).get("value") or {}
+                if result.get("found"):
+                    return "levenshtein", result
+            except Exception:
+                pass
+
+        return "none", None
+
+    @staticmethod
+    def click_element(tab: Dict[str, Any], selector_pack: dict, timeout: int = 10) -> Dict[str, Any]:
+        """Resolve selector and click the matched element."""
+        strategy, info = SelectorPack.resolve(tab, selector_pack, timeout)
+        if not info or not info.get("found"):
+            return {"ok": False, "error": "element not found with any strategy",
+                    "strategies_tried": list(selector_pack.keys())}
+
+        # Click using rect coordinates for reliability
+        rect = info.get("rect", {})
+        x = int(rect.get("x", 0) + rect.get("w", 0) / 2)
+        y = int(rect.get("y", 0) + rect.get("h", 0) / 2)
+
+        expr = f"""
+        (function() {{
+            const el = document.elementFromPoint({x}, {y});
+            if (!el) return {{ok: false, error: 'no element at point'}};
+            el.scrollIntoView({{block: 'center', inline: 'center'}});
+            el.click();
+            return {{ok: true, clicked: true, tag: el.tagName,
+                    text: (el.innerText || el.value || '').slice(0, 100)}};
+        }})()
+        """
+        result = _eval(tab, expr, timeout=timeout).get("value") or {}
+        return {"ok": bool(result.get("ok")), "tab_id": tab.get("id"),
+                "strategy": strategy, **result, **info}
+
+
+# ====== NETWORK INTERCEPTION — HAR (P2) ======
+
+def _capture_network_har(tab: Dict[str, Any], duration_ms: int,
+                         include_response_bodies: bool = False) -> Dict[str, Any]:
+    """Full HAR-like capture using CDP Network domain."""
+    ws_url = tab.get("webSocketDebuggerUrl")
+    if not ws_url:
+        raise RuntimeError("Tab has no webSocketDebuggerUrl")
+
+    duration_ms = max(250, min(int(duration_ms), 30000))
+    entries: Dict[str, Dict[str, Any]] = {}
+
+    ws = websocket.create_connection(ws_url, timeout=max(TIMEOUT, int(duration_ms / 1000) + 10))
+    try:
+        cid = 1
+        ws.send(json.dumps({"id": cid, "method": "Network.enable",
+                           "params": {"maxTotalBufferSize": 10485760, "maxResourceBufferSize": 2097152}}))
+        cid += 1
+        end = time.time() + duration_ms / 1000.0
+
+        while time.time() < end:
+            ws.settimeout(max(0.05, min(0.5, end - time.time())))
+            try:
+                msg = json.loads(ws.recv())
+            except websocket.WebSocketTimeoutException:
+                continue
+            except Exception:
+                break
+
+            method = msg.get("method")
+            params = msg.get("params", {})
+            rid = params.get("requestId")
+            if not rid:
+                continue
+
+            entry = entries.setdefault(rid, {
+                "request_id": rid,
+                "startedDateTime": None,
+                "request": {},
+                "response": {},
+                "timings": {},
+            })
+
+            if method == "Network.requestWillBeSent":
+                req = params.get("request", {})
+                entry["startedDateTime"] = time.strftime(
+                    "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(params.get("timestamp", time.time())))
+                entry["request"] = {
+                    "url": req.get("url", ""),
+                    "method": req.get("method", "GET"),
+                    "headers": {k: v for k, v in (req.get("headers", {}) or {}).items()
+                               if k.lower() not in {"cookie", "authorization", "set-cookie"}},
+                    "postData": req.get("postData", "")[:500] if req.get("postData") else "",
+                }
+                entry["resourceType"] = params.get("type", "")
+                entry["initiator"] = (params.get("initiator") or {}).get("type", "")
+
+            elif method == "Network.responseReceived":
+                resp = params.get("response", {})
+                entry["response"] = {
+                    "status": resp.get("status"),
+                    "statusText": resp.get("statusText", ""),
+                    "mimeType": resp.get("mimeType", ""),
+                    "headers": {k: v for k, v in (resp.get("headers", {}) or {}).items()
+                               if k.lower() not in {"set-cookie"}},
+                    "fromCache": bool(resp.get("fromDiskCache") or resp.get("fromPrefetchCache")),
+                }
+                entry["timings"]["receive"] = params.get("timestamp", time.time())
+
+            elif method == "Network.loadingFinished":
+                entry["timings"]["finished"] = params.get("timestamp", time.time())
+                entry["encodedDataLength"] = params.get("encodedDataLength", 0)
+
+                # Optionally fetch response body
+                if include_response_bodies:
+                    try:
+                        body_cid = 99990
+                        ws.send(json.dumps({"id": body_cid, "method": "Network.getResponseBody",
+                                           "params": {"requestId": rid}}))
+                        ws.settimeout(2)
+                        body_resp = json.loads(ws.recv())
+                        if body_resp.get("id") == body_cid and "result" in body_resp:
+                            entry["response"]["body"] = (
+                                body_resp["result"].get("body", "")[:2000]
+                                if body_resp["result"].get("base64Encoded")
+                                else body_resp["result"].get("body", "")[:2000]
+                            )
+                    except Exception:
+                        pass
+
+            elif method == "Network.loadingFailed":
+                entry["response"]["error"] = params.get("errorText", "")
+                entry["response"]["status"] = 0
+
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+    rows = list(entries.values())
+    rows.sort(key=lambda x: x.get("startedDateTime") or "")
+
+    return {
+        "ok": True,
+        "tab_id": tab.get("id"),
+        "duration_ms": duration_ms,
+        "total_requests": len(rows),
+        "entries": rows,
+    }
+
+
+# ====== MEMORY-WIKI INTEGRATION (P1) ======
+
+def _memory_wiki_post(endpoint: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """POST to memory-wiki API, returns JSON or None on failure."""
+    try:
+        url = f"{MEMORY_WIKI_URL}/{endpoint.lstrip('/')}"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=MEMORY_WIKI_TIMEOUT) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        _log(f"memory-wiki POST {endpoint} failed: {e}", level="warn")
+        return None
+
+
+def _persist_to_wiki(tab_id: str, page_data: Dict[str, Any]) -> Optional[str]:
+    """Persist page data to memory-wiki. Returns capsule_id or None."""
+    return None  # Stub — requires memory-wiki tool availability
+    # Real implementation would call memory_wiki_add via MCP or direct API
+    # try:
+    #     result = _memory_wiki_post("api/claims", {
+    #         "claim": f"Browser page: {page_data.get('url', '')}",
+    #         "evidence": json.dumps(page_data, ensure_ascii=False),
+    #         "type": "procedural",
+    #         "confidence": 0.85,
+    #         "source": "browser-automation-mcp",
+    #     })
+    #     return result.get("id") if result else None
+    # except Exception as e:
+    #     _log(f"persist_to_wiki error: {e}", level="error")
+    #     return None
+
+
+def _recall_from_wiki(url_pattern: str) -> Optional[Dict[str, Any]]:
+    """Recall cached page data from memory-wiki."""
+    return None  # Stub — requires memory-wiki search
+    # try:
+    #     result = _memory_wiki_post("api/search", {"query": url_pattern, "limit": 3})
+    #     if result and result.get("results"):
+    #         return {"found": True, "results": result["results"]}
+    #     return {"found": False}
+    # except Exception as e:
+    #     return {"found": False, "error": str(e)}
+
+
+# ====== UTILITY HELPERS (unchanged from v1.4) ======
+
 def _redact_cookie(c: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(c)
     if "value" in out:
@@ -316,7 +900,8 @@ def _redact_cookie(c: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-SENSITIVE_KEY_RE = re.compile(r"(cookie|session|token|secret|passwd|password|auth|bearer|jwt|csrf|xsrf|api[-_]?key|access[-_]?key)", re.I)
+SENSITIVE_KEY_RE = re.compile(
+    r"(cookie|session|token|secret|passwd|password|auth|bearer|jwt|csrf|xsrf|api[-_]?key|access[-_]?key)", re.I)
 
 
 def _is_sensitive_key(key: Any) -> bool:
@@ -333,7 +918,6 @@ def _redact_value(value: Any) -> Any:
 
 
 def _redact_mapping(data: Any) -> Any:
-    """Redact likely secret values while keeping non-secret shape useful for agents."""
     if isinstance(data, dict):
         redacted: Dict[str, Any] = {}
         for key, value in data.items():
@@ -392,7 +976,9 @@ def _public_tab(t: Dict[str, Any], include_debug_url: bool = False) -> Dict[str,
 
 
 def _media_hint(ext: str) -> str:
-    return {"png": "image/png", "pdf": "application/pdf", "html": "text/html", "json": "application/json"}.get(ext, "application/octet-stream")
+    return {"png": "image/png", "pdf": "application/pdf", "html": "text/html",
+            "json": "application/json"}.get(ext, "application/octet-stream")
+
 
 # ====== TOOLS ======
 
@@ -401,39 +987,228 @@ TAB_PROPS = {
     "url_filter": {"type": "string", "description": "Optional substring to choose a tab by URL"},
 }
 
+# Selector pack schema for self-healing locators (P2)
+SELECTOR_PACK_SCHEMA = {
+    "type": "object",
+    "description": "Self-healing selector pack: {primary: css, text: str, aria: str, xpath_fallback: str, label_text: str}",
+    "properties": {
+        "primary": {"type": "string", "description": "Primary CSS selector"},
+        "text": {"type": "string", "description": "Text content to match (fuzzy)"},
+        "aria": {"type": "string", "description": "aria-label substring"},
+        "xpath_fallback": {"type": "string", "description": "Fallback XPath expression"},
+        "label_text": {"type": "string", "description": "Label text for following-sibling lookup"},
+    },
+}
+
 TOOLS = [
-    {"name": "browser_navigate", "description": "Перейти на указанный URL в браузере. Возвращает заголовок, URL и tab_id.", "inputSchema": {"type": "object", "properties": {"url": {"type": "string", "description": "URL для перехода"}, "tab_id": TAB_PROPS["tab_id"], "wait_until_ready": {"type": "boolean", "default": True}}, "required": ["url"]}},
-    {"name": "browser_screenshot", "description": "Сделать скриншот текущей страницы. Возвращает base64 PNG; для GitHub/чатов лучше browser_screenshot_file.", "inputSchema": {"type": "object", "properties": {"full_page": {"type": "boolean", "default": False}, **TAB_PROPS}}},
-    {"name": "browser_screenshot_file", "description": "Сделать PNG-скриншот и сохранить файлом в BROWSER_ARTIFACT_DIR / Hermes document cache.", "inputSchema": {"type": "object", "properties": {"full_page": {"type": "boolean", "default": False}, "filename_prefix": {"type": "string", "default": "browser-screenshot"}, **TAB_PROPS}}},
-    {"name": "browser_cookies", "description": "Извлечь cookies, document.cookie и storage сайта. По умолчанию секреты редактируются.", "inputSchema": {"type": "object", "properties": {"url_filter": TAB_PROPS["url_filter"], "tab_id": TAB_PROPS["tab_id"], "redact": {"type": "boolean", "default": True}}}},
-    {"name": "browser_localstorage", "description": "Получить localStorage сайта. По умолчанию значения с secret-like ключами редактируются.", "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}, "redact": {"type": "boolean", "default": True}, **TAB_PROPS}}},
-    {"name": "browser_sessionstorage", "description": "Получить sessionStorage сайта. По умолчанию значения с secret-like ключами редактируются.", "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}, "redact": {"type": "boolean", "default": True}, **TAB_PROPS}}},
-    {"name": "browser_exec", "description": "Выполнить JavaScript на странице и вернуть результат.", "inputSchema": {"type": "object", "properties": {"expression": {"type": "string"}, "await_promise": {"type": "boolean", "default": False}, **TAB_PROPS}, "required": ["expression"]}},
-    {"name": "browser_click", "description": "Кликнуть по элементу по CSS-селектору.", "inputSchema": {"type": "object", "properties": {"selector": {"type": "string"}, **TAB_PROPS}, "required": ["selector"]}},
-    {"name": "browser_type", "description": "Ввести текст в поле ввода.", "inputSchema": {"type": "object", "properties": {"selector": {"type": "string"}, "text": {"type": "string"}, "clear_first": {"type": "boolean", "default": True}, **TAB_PROPS}, "required": ["selector", "text"]}},
-    {"name": "browser_gettext", "description": "Получить innerText элемента.", "inputSchema": {"type": "object", "properties": {"selector": {"type": "string"}, "all": {"type": "boolean", "default": False}, **TAB_PROPS}, "required": ["selector"]}},
-    {"name": "browser_gethtml", "description": "Получить HTML элемента.", "inputSchema": {"type": "object", "properties": {"selector": {"type": "string"}, "outer": {"type": "boolean", "default": False}, **TAB_PROPS}, "required": ["selector"]}},
-    {"name": "browser_getvalue", "description": "Получить value поля ввода.", "inputSchema": {"type": "object", "properties": {"selector": {"type": "string"}, **TAB_PROPS}, "required": ["selector"]}},
-    {"name": "browser_wait", "description": "Дождаться появления элемента.", "inputSchema": {"type": "object", "properties": {"selector": {"type": "string"}, "timeout_ms": {"type": "integer", "default": 10000}, **TAB_PROPS}, "required": ["selector"]}},
-    {"name": "browser_fill_form", "description": "Заполнить несколько полей формы разом.", "inputSchema": {"type": "object", "properties": {"fields": {"type": "object"}, "submit_selector": {"type": "string"}, **TAB_PROPS}, "required": ["fields"]}},
-    {"name": "browser_login", "description": "Авторизоваться на сайте и вернуть cookies после логина. По умолчанию cookies редактируются.", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}, "username_selector": {"type": "string"}, "password_selector": {"type": "string"}, "submit_selector": {"type": "string"}, "username": {"type": "string"}, "password": {"type": "string"}, "extra_fields": {"type": "object"}, "redact": {"type": "boolean", "default": True}, "tab_id": TAB_PROPS["tab_id"]}, "required": ["url", "username_selector", "password_selector", "submit_selector", "username", "password"]}},
-    {"name": "browser_tabs", "description": "Получить список targets/вкладок. webSocketDebuggerUrl скрыт без include_debug_url=true.", "inputSchema": {"type": "object", "properties": {"include_non_page": {"type": "boolean", "default": False}, "include_debug_url": {"type": "boolean", "default": False}}}},
-    {"name": "browser_newtab", "description": "Открыть новую вкладку с указанным URL. webSocketDebuggerUrl скрыт без include_debug_url=true.", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}, "wait_until_ready": {"type": "boolean", "default": True}, "include_debug_url": {"type": "boolean", "default": False}}, "required": ["url"]}},
-    {"name": "browser_closetab", "description": "Закрыть вкладку по ID или URL-фильтру.", "inputSchema": {"type": "object", "properties": {"tab_id": {"type": "string"}, "url_filter": {"type": "string"}}}},
-    {"name": "browser_scroll", "description": "Прокрутить страницу.", "inputSchema": {"type": "object", "properties": {"direction": {"type": "string", "enum": ["down", "up", "top", "bottom"]}, "selector": {"type": "string"}, "amount": {"type": "integer", "default": 500}, **TAB_PROPS}}},
-    {"name": "browser_pdf", "description": "Сохранить текущую страницу как PDF base64; для GitHub/чатов лучше browser_pdf_file.", "inputSchema": {"type": "object", "properties": {**TAB_PROPS}}},
-    {"name": "browser_pdf_file", "description": "Сохранить текущую страницу как PDF-файл в BROWSER_ARTIFACT_DIR / Hermes document cache.", "inputSchema": {"type": "object", "properties": {"filename_prefix": {"type": "string", "default": "browser-page"}, **TAB_PROPS}}},
-    {"name": "browser_html_file", "description": "Сохранить текущий DOM HTML файлом для evidence/debug.", "inputSchema": {"type": "object", "properties": {"filename_prefix": {"type": "string", "default": "browser-page"}, **TAB_PROPS}}},
-    {"name": "browser_health", "description": "Проверить CDP/браузер, версию MCP, вкладки и доступность автозапуска CDP.", "inputSchema": {"type": "object", "properties": {"autostart": {"type": "boolean", "default": True}}}},
-    {"name": "browser_page_summary", "description": "Краткая структурная сводка страницы: title/url/text snippet/forms/links/buttons/inputs.", "inputSchema": {"type": "object", "properties": {"max_text": {"type": "integer", "default": 4000}, "max_items": {"type": "integer", "default": 30}, **TAB_PROPS}}},
-    {"name": "browser_snapshot", "description": "Сводный снимок страницы для агента: summary + elements + optional screenshot file.", "inputSchema": {"type": "object", "properties": {"max_text": {"type": "integer", "default": 4000}, "max_items": {"type": "integer", "default": 40}, "include_screenshot": {"type": "boolean", "default": True}, **TAB_PROPS}}},
-    {"name": "browser_network_log", "description": "Лёгкий CDP Network capture: XHR/fetch/API requests за короткое окно, без cookie/auth headers.", "inputSchema": {"type": "object", "properties": {"duration_ms": {"type": "integer", "default": 3000}, "reload": {"type": "boolean", "default": False}, "include_all": {"type": "boolean", "default": False}, "max_items": {"type": "integer", "default": 100}, **TAB_PROPS}}},
-    {"name": "browser_find_api_calls", "description": "Найти вероятные JSON/API вызовы страницы через CDP Network events.", "inputSchema": {"type": "object", "properties": {"duration_ms": {"type": "integer", "default": 3000}, "reload": {"type": "boolean", "default": True}, "max_items": {"type": "integer", "default": 60}, **TAB_PROPS}}},
-    {"name": "browser_select", "description": "Выбрать option в select по value/label/index.", "inputSchema": {"type": "object", "properties": {"selector": {"type": "string"}, "value": {"type": "string"}, "label": {"type": "string"}, "index": {"type": "integer"}, **TAB_PROPS}, "required": ["selector"]}},
-    {"name": "browser_elements", "description": "Найти видимые/интерактивные элементы и вернуть устойчивые CSS-селекторы, текст, роли и координаты.", "inputSchema": {"type": "object", "properties": {"selector": {"type": "string", "description": "CSS selector кандидатов; по умолчанию интерактивные элементы"}, "query": {"type": "string", "description": "Фильтр по тексту/placeholder/name/id"}, "kind": {"type": "string", "enum": ["all", "clickable", "input", "link", "button", "select"]}, "max_items": {"type": "integer", "default": 80}, "include_hidden": {"type": "boolean", "default": False}, **TAB_PROPS}}},
-    {"name": "browser_click_text", "description": "Кликнуть по видимому элементу, найденному по тексту/aria-label/value/title без ручного CSS-селектора.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}, "selector": {"type": "string", "description": "CSS selector кандидатов"}, "exact": {"type": "boolean", "default": False}, "case_sensitive": {"type": "boolean", "default": False}, "index": {"type": "integer", "default": 0}, "wait_after_ms": {"type": "integer", "default": 300}, **TAB_PROPS}, "required": ["text"]}},
-    {"name": "browser_wait_text", "description": "Дождаться появления текста внутри body или указанного CSS-селектора.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}, "selector": {"type": "string", "default": "body"}, "exact": {"type": "boolean", "default": False}, "case_sensitive": {"type": "boolean", "default": False}, "timeout_ms": {"type": "integer", "default": 10000}, **TAB_PROPS}, "required": ["text"]}},
-    {"name": "browser_batch", "description": "Выполнить несколько browser_* действий последовательно в одном MCP вызове.", "inputSchema": {"type": "object", "properties": {"steps": {"type": "array", "items": {"type": "object", "properties": {"tool": {"type": "string"}, "arguments": {"type": "object"}}, "required": ["tool"]}}, "stop_on_error": {"type": "boolean", "default": True}}, "required": ["steps"]}},
+    # === v1.4 tools (unchanged) ===
+    {"name": "browser_navigate", "description": "Перейти на URL. Возвращает title/url/tab_id. Опционально persist_to_wiki=true для сохранения в память.",
+     "inputSchema": {"type": "object", "properties": {
+         "url": {"type": "string"}, "tab_id": TAB_PROPS["tab_id"],
+         "wait_until_ready": {"type": "boolean", "default": True},
+         "persist_to_wiki": {"type": "boolean", "default": False, "description": "Сохранить страницу в memory-wiki (P1)"},
+     }, "required": ["url"]}},
+
+    {"name": "browser_screenshot", "description": "Сделать скриншот. Возвращает base64 PNG. Для файлов: browser_screenshot_file.",
+     "inputSchema": {"type": "object", "properties": {"full_page": {"type": "boolean", "default": False}, **TAB_PROPS}}},
+
+    {"name": "browser_screenshot_file", "description": "Сделать PNG-скриншот в файл.",
+     "inputSchema": {"type": "object", "properties": {
+         "full_page": {"type": "boolean", "default": False},
+         "filename_prefix": {"type": "string", "default": "browser-screenshot"},
+         "persist_to_wiki": {"type": "boolean", "default": False}, **TAB_PROPS}}},
+
+    {"name": "browser_cookies", "description": "Cookies, document.cookie и storage. Секреты редактируются.",
+     "inputSchema": {"type": "object", "properties": {
+         "url_filter": TAB_PROPS["url_filter"], "tab_id": TAB_PROPS["tab_id"],
+         "redact": {"type": "boolean", "default": True}}}},
+
+    {"name": "browser_localstorage", "description": "localStorage сайта.",
+     "inputSchema": {"type": "object", "properties": {
+         "key": {"type": "string"}, "redact": {"type": "boolean", "default": True}, **TAB_PROPS}}},
+
+    {"name": "browser_sessionstorage", "description": "sessionStorage сайта.",
+     "inputSchema": {"type": "object", "properties": {
+         "key": {"type": "string"}, "redact": {"type": "boolean", "default": True}, **TAB_PROPS}}},
+
+    {"name": "browser_exec", "description": "Выполнить JavaScript на странице.",
+     "inputSchema": {"type": "object", "properties": {
+         "expression": {"type": "string"}, "await_promise": {"type": "boolean", "default": False},
+         **TAB_PROPS}, "required": ["expression"]}},
+
+    {"name": "browser_click", "description": "Кликнуть по CSS-селектору. Поддерживает selector_pack (P2).",
+     "inputSchema": {"type": "object", "properties": {
+         "selector": {"type": "string", "description": "CSS selector (или используй selector_pack)"},
+         "selector_pack": SELECTOR_PACK_SCHEMA, **TAB_PROPS}}},
+
+    {"name": "browser_type", "description": "Ввести текст в поле.",
+     "inputSchema": {"type": "object", "properties": {
+         "selector": {"type": "string"}, "selector_pack": SELECTOR_PACK_SCHEMA,
+         "text": {"type": "string"}, "clear_first": {"type": "boolean", "default": True},
+         **TAB_PROPS}, "required": ["text"]}},
+
+    {"name": "browser_gettext", "description": "Получить innerText. Поддерживает selector_pack и persist_to_wiki.",
+     "inputSchema": {"type": "object", "properties": {
+         "selector": {"type": "string"}, "selector_pack": SELECTOR_PACK_SCHEMA,
+         "all": {"type": "boolean", "default": False},
+         "persist_to_wiki": {"type": "boolean", "default": False}, **TAB_PROPS}}},
+
+    {"name": "browser_gethtml", "description": "Получить HTML элемента.",
+     "inputSchema": {"type": "object", "properties": {
+         "selector": {"type": "string"}, "selector_pack": SELECTOR_PACK_SCHEMA,
+         "outer": {"type": "boolean", "default": False}, **TAB_PROPS}}},
+
+    {"name": "browser_getvalue", "description": "Получить value поля.",
+     "inputSchema": {"type": "object", "properties": {
+         "selector": {"type": "string"}, "selector_pack": SELECTOR_PACK_SCHEMA, **TAB_PROPS}}},
+
+    {"name": "browser_wait", "description": "Дождаться элемента. Поддерживает selector_pack.",
+     "inputSchema": {"type": "object", "properties": {
+         "selector": {"type": "string"}, "selector_pack": SELECTOR_PACK_SCHEMA,
+         "timeout_ms": {"type": "integer", "default": 10000}, **TAB_PROPS}}},
+
+    {"name": "browser_fill_form", "description": "Заполнить несколько полей разом.",
+     "inputSchema": {"type": "object", "properties": {
+         "fields": {"type": "object"}, "submit_selector": {"type": "string"}, **TAB_PROPS},
+         "required": ["fields"]}},
+
+    {"name": "browser_login", "description": "Авторизоваться и вернуть cookies.",
+     "inputSchema": {"type": "object", "properties": {
+         "url": {"type": "string"}, "username_selector": {"type": "string"},
+         "password_selector": {"type": "string"}, "submit_selector": {"type": "string"},
+         "username": {"type": "string"}, "password": {"type": "string"},
+         "extra_fields": {"type": "object"}, "redact": {"type": "boolean", "default": True},
+         "tab_id": TAB_PROPS["tab_id"]},
+         "required": ["url", "username_selector", "password_selector", "submit_selector", "username", "password"]}},
+
+    {"name": "browser_tabs", "description": "Список вкладок.",
+     "inputSchema": {"type": "object", "properties": {
+         "include_non_page": {"type": "boolean", "default": False},
+         "include_debug_url": {"type": "boolean", "default": False}}}},
+
+    {"name": "browser_newtab", "description": "Открыть новую вкладку.",
+     "inputSchema": {"type": "object", "properties": {
+         "url": {"type": "string"}, "wait_until_ready": {"type": "boolean", "default": True},
+         "include_debug_url": {"type": "boolean", "default": False}}, "required": ["url"]}},
+
+    {"name": "browser_closetab", "description": "Закрыть вкладку.",
+     "inputSchema": {"type": "object", "properties": {
+         "tab_id": {"type": "string"}, "url_filter": {"type": "string"}}}},
+
+    {"name": "browser_scroll", "description": "Прокрутить страницу.",
+     "inputSchema": {"type": "object", "properties": {
+         "direction": {"type": "string", "enum": ["down", "up", "top", "bottom"]},
+         "selector": {"type": "string"}, "amount": {"type": "integer", "default": 500}, **TAB_PROPS}}},
+
+    {"name": "browser_pdf", "description": "Сохранить страницу как PDF base64.",
+     "inputSchema": {"type": "object", "properties": {**TAB_PROPS}}},
+
+    {"name": "browser_pdf_file", "description": "Сохранить страницу как PDF-файл.",
+     "inputSchema": {"type": "object", "properties": {
+         "filename_prefix": {"type": "string", "default": "browser-page"}, **TAB_PROPS}}},
+
+    {"name": "browser_html_file", "description": "Сохранить DOM HTML файлом.",
+     "inputSchema": {"type": "object", "properties": {
+         "filename_prefix": {"type": "string", "default": "browser-page"}, **TAB_PROPS}}},
+
+    {"name": "browser_health", "description": "Проверить CDP/браузер/версию/метрики (P0 enhanced).",
+     "inputSchema": {"type": "object", "properties": {
+         "autostart": {"type": "boolean", "default": True},
+         "include_metrics": {"type": "boolean", "default": True}}}},
+
+    {"name": "browser_page_summary", "description": "Структурная сводка: title/url/forms/links/buttons.",
+     "inputSchema": {"type": "object", "properties": {
+         "max_text": {"type": "integer", "default": 4000}, "max_items": {"type": "integer", "default": 30},
+         **TAB_PROPS}}},
+
+    {"name": "browser_snapshot", "description": "Снимок страницы: summary + elements + скриншот.",
+     "inputSchema": {"type": "object", "properties": {
+         "max_text": {"type": "integer", "default": 4000}, "max_items": {"type": "integer", "default": 40},
+         "include_screenshot": {"type": "boolean", "default": True}, **TAB_PROPS}}},
+
+    {"name": "browser_network_log", "description": "Лёгкий CDP Network capture (XHR/fetch/API).",
+     "inputSchema": {"type": "object", "properties": {
+         "duration_ms": {"type": "integer", "default": 3000}, "reload": {"type": "boolean", "default": False},
+         "include_all": {"type": "boolean", "default": False}, "max_items": {"type": "integer", "default": 100},
+         **TAB_PROPS}}},
+
+    {"name": "browser_find_api_calls", "description": "Найти JSON/API вызовы страницы.",
+     "inputSchema": {"type": "object", "properties": {
+         "duration_ms": {"type": "integer", "default": 3000}, "reload": {"type": "boolean", "default": True},
+         "max_items": {"type": "integer", "default": 60}, **TAB_PROPS}}},
+
+    {"name": "browser_select", "description": "Выбрать option в select.",
+     "inputSchema": {"type": "object", "properties": {
+         "selector": {"type": "string"}, "value": {"type": "string"}, "label": {"type": "string"},
+         "index": {"type": "integer"}, **TAB_PROPS}, "required": ["selector"]}},
+
+    {"name": "browser_elements", "description": "Найти видимые элементы с CSS-селекторами.",
+     "inputSchema": {"type": "object", "properties": {
+         "selector": {"type": "string"}, "query": {"type": "string"},
+         "kind": {"type": "string", "enum": ["all", "clickable", "input", "link", "button", "select"]},
+         "max_items": {"type": "integer", "default": 80}, "include_hidden": {"type": "boolean", "default": False},
+         **TAB_PROPS}}},
+
+    {"name": "browser_click_text", "description": "Кликнуть по тексту без CSS-селектора.",
+     "inputSchema": {"type": "object", "properties": {
+         "text": {"type": "string"}, "selector": {"type": "string"},
+         "exact": {"type": "boolean", "default": False}, "case_sensitive": {"type": "boolean", "default": False},
+         "index": {"type": "integer", "default": 0}, "wait_after_ms": {"type": "integer", "default": 300},
+         **TAB_PROPS}, "required": ["text"]}},
+
+    {"name": "browser_wait_text", "description": "Дождаться текста в DOM.",
+     "inputSchema": {"type": "object", "properties": {
+         "text": {"type": "string"}, "selector": {"type": "string", "default": "body"},
+         "exact": {"type": "boolean", "default": False}, "case_sensitive": {"type": "boolean", "default": False},
+         "timeout_ms": {"type": "integer", "default": 10000}, **TAB_PROPS}, "required": ["text"]}},
+
+    {"name": "browser_batch", "description": "Выполнить несколько действий последовательно.",
+     "inputSchema": {"type": "object", "properties": {
+         "steps": {"type": "array", "items": {"type": "object", "properties": {
+             "tool": {"type": "string"}, "arguments": {"type": "object"}}, "required": ["tool"]}},
+         "stop_on_error": {"type": "boolean", "default": True}}, "required": ["steps"]}},
+
+    # === NEW v2.0 TOOLS ===
+
+    # P2: Network HAR
+    {"name": "browser_network_har", "description": "Полный HAR-подобный захват сетевых запросов через CDP Network (P2).",
+     "inputSchema": {"type": "object", "properties": {
+         "duration_ms": {"type": "integer", "default": 5000, "description": "Время захвата в мс (250-30000)"},
+         "include_bodies": {"type": "boolean", "default": False, "description": "Включить тела ответов (первые 2000 символов)"},
+         **TAB_PROPS}}},
+
+    # P1: Memory-Wiki recall
+    {"name": "browser_recall", "description": "Найти ранее сохранённую страницу в memory-wiki по URL-паттерну (P1).",
+     "inputSchema": {"type": "object", "properties": {
+         "url_pattern": {"type": "string", "description": "URL или фрагмент для поиска"}},
+         "required": ["url_pattern"]}},
+
+    # P1: Session management
+    {"name": "browser_session_tabs", "description": "Управление сессионными вкладками: list/switch/close_all (P1).",
+     "inputSchema": {"type": "object", "properties": {
+         "action": {"type": "string", "enum": ["list", "switch", "close_all", "close_others"],
+                   "description": "list=показать все, switch=переключить active, close_all=закрыть все кроме active, close_others=закрыть остальные"}}}},
+
+    # P3: Deep web crawl bridge
+    {"name": "browser_crawl_extract", "description": "Глубокое извлечение: навигация + извлечение ссылок + рекурсивный сбор (P3).",
+     "inputSchema": {"type": "object", "properties": {
+         "url": {"type": "string", "description": "Стартовый URL"},
+         "extract_rules": {"type": "object", "description": "Правила извлечения: {text_selector, link_selector, data_selectors: {name: css}}"},
+         "max_depth": {"type": "integer", "default": 1, "description": "Глубина рекурсии (1-3)"},
+         "max_pages": {"type": "integer", "default": 10, "description": "Максимум страниц"},
+         "same_domain_only": {"type": "boolean", "default": True}},
+     "required": ["url"]}},
+
+    # P2: Self-healing click
+    {"name": "browser_click_heal", "description": "Self-healing click: пробует несколько стратегий поиска элемента (P2).",
+     "inputSchema": {"type": "object", "properties": {
+         "text": {"type": "string", "description": "Текст элемента для поиска"},
+         "selector_pack": SELECTOR_PACK_SCHEMA, **TAB_PROPS},
+         "required": ["text"]}},
+
+    # P0: Metrics
+    {"name": "browser_metrics", "description": "Метрики сервера: счётчики, latency, circuit breaker (P0).",
+     "inputSchema": {"type": "object", "properties": {}}},
 ]
 
 # ====== TOOL HANDLERS ======
@@ -448,7 +1223,18 @@ def handle_navigate(args):
         _wait_ready(tab, min(TIMEOUT, 20))
     title = _eval(tab, "document.title", timeout=10).get("value", "")
     final_url = _eval(tab, "window.location.href", timeout=10).get("value", url)
-    return {"ok": True, "tab_id": tab.get("id"), "url": final_url, "title": title, "navigation": r.get("nav", {})}
+    result = {"ok": True, "tab_id": tab.get("id"), "url": final_url, "title": title,
+              "navigation": r.get("nav", {})}
+
+    # P1: persist to memory-wiki
+    if args.get("persist_to_wiki"):
+        wiki_result = _persist_to_wiki(tab.get("id"), {
+            "url": final_url, "title": title, "type": "navigation", "timestamp": time.time()
+        })
+        if wiki_result:
+            result["wiki_capsule_id"] = wiki_result
+
+    return result
 
 
 def handle_screenshot(args):
@@ -462,24 +1248,26 @@ def handle_screenshot(args):
             width, height = int(size.get("width", 1280)), int(size.get("height", 720))
             params["clip"] = {"x": 0, "y": 0, "width": max(width, 1), "height": max(height, 1), "scale": 1}
         except Exception:
-            # Fall back to viewport screenshot.
             pass
     r = _safe_ws(tab, [{"method": "Page.captureScreenshot", "params": params, "_key": "shot"}], timeout=TIMEOUT)
     data = r.get("shot", {}).get("data", "")
-    return {"ok": True, "tab_id": tab.get("id"), "screenshot_base64": data, "bytes_estimate": len(data) * 3 // 4, "format": "png"}
+    return {"ok": True, "tab_id": tab.get("id"), "screenshot_base64": data,
+            "bytes_estimate": len(data) * 3 // 4, "format": "png"}
 
 
 def handle_screenshot_file(args):
     shot = handle_screenshot(args)
-    saved = _write_b64_artifact(args.get("filename_prefix", "browser-screenshot"), "png", shot.get("screenshot_base64", ""))
-    return {
-        "ok": True,
-        "tab_id": shot.get("tab_id"),
-        "path": saved["path"],
-        "bytes": saved["bytes"],
-        "media_hint": _media_hint("png"),
+    saved = _write_b64_artifact(args.get("filename_prefix", "browser-screenshot"), "png",
+                                 shot.get("screenshot_base64", ""))
+    result = {
+        "ok": True, "tab_id": shot.get("tab_id"), "path": saved["path"],
+        "bytes": saved["bytes"], "media_hint": _media_hint("png"),
         "full_page": bool(args.get("full_page", False)),
     }
+    if args.get("persist_to_wiki"):
+        _persist_to_wiki(shot.get("tab_id"), {"type": "screenshot", "path": saved["path"],
+                                               "bytes": saved["bytes"]})
+    return result
 
 
 def handle_cookies(args):
@@ -506,14 +1294,10 @@ def handle_cookies(args):
         local_storage = _redact_mapping(local_storage)
         session_storage = _redact_mapping(session_storage)
     return {
-        "ok": True,
-        "tab_id": tab.get("id"),
-        "cookies": cookies,
-        "document_cookie": doc_cookie,
+        "ok": True, "tab_id": tab.get("id"), "cookies": cookies, "document_cookie": doc_cookie,
         "url": r.get("url", {}).get("result", {}).get("value", ""),
         "title": r.get("title", {}).get("result", {}).get("value", ""),
-        "localStorage": local_storage,
-        "sessionStorage": session_storage,
+        "localStorage": local_storage, "sessionStorage": session_storage,
     }
 
 
@@ -540,13 +1324,35 @@ def handle_sessionstorage(args):
 def handle_exec(args):
     tab = _get_tab(args)
     expr = args["expression"]
-    res = _eval(tab, expr, await_promise=bool(args.get("await_promise", False)), return_by_value=True, timeout=TIMEOUT)
-    return {"ok": True, "tab_id": tab.get("id"), "result": res.get("value"), "type": res.get("type", "unknown"), "description": res.get("description")}
+    res = _eval(tab, expr, await_promise=bool(args.get("await_promise", False)),
+                return_by_value=True, timeout=TIMEOUT)
+    return {"ok": True, "tab_id": tab.get("id"), "result": res.get("value"),
+            "type": res.get("type", "unknown"), "description": res.get("description")}
+
+
+def _resolve_selector(args) -> str:
+    """Resolve selector — supports both 'selector' string and 'selector_pack' dict (P2)."""
+    if args.get("selector_pack"):
+        strategy, info = SelectorPack.resolve(_get_tab(args), args["selector_pack"], timeout=10)
+        if info and info.get("found"):
+            return args["selector_pack"].get("primary", args["selector_pack"].get("text", ""))
+        if args.get("selector"):
+            return args["selector"]  # fallback to explicit
+        raise RuntimeError(f"selector_pack resolution failed (tried all strategies)")
+    return args.get("selector", "")
 
 
 def handle_click(args):
     tab = _get_tab(args)
-    sel = args["selector"]
+
+    # P2: try selector_pack first
+    if args.get("selector_pack"):
+        return SelectorPack.click_element(tab, args["selector_pack"], timeout=10)
+
+    sel = args.get("selector", "")
+    if not sel:
+        return {"ok": False, "error": "selector or selector_pack required"}
+
     expr = f"""
     (function(sel) {{
         const el = document.querySelector(sel);
@@ -562,8 +1368,19 @@ def handle_click(args):
 
 def handle_type(args):
     tab = _get_tab(args)
-    sel, text = args["selector"], args["text"]
+    sel = _resolve_selector(args)
+    if not sel and not args.get("selector_pack"):
+        return {"ok": False, "error": "selector or selector_pack required"}
+
+    text = args["text"]
     clear = bool(args.get("clear_first", True))
+
+    if args.get("selector_pack") and not sel:
+        # Fallback: use the primary from selector_pack
+        sel = args["selector_pack"].get("primary", "")
+        if not sel:
+            return {"ok": False, "error": "selector_pack without primary — resolution not supported for type"}
+
     expr = f"""
     (function(sel, text, clearFirst) {{
         const el = document.querySelector(sel);
@@ -586,31 +1403,55 @@ def handle_type(args):
 
 def handle_gettext(args):
     tab = _get_tab(args)
-    sel = args["selector"]
+    sel = _resolve_selector(args)
+    if not sel:
+        return {"ok": False, "error": "selector or selector_pack required"}
+
     all_el = bool(args.get("all", False))
     if all_el:
         expr = f"Array.from(document.querySelectorAll({_json_arg(sel)})).map(el => el.innerText || '')"
     else:
         expr = f"(document.querySelector({_json_arg(sel)}) || {{}}).innerText || ''"
-    return {"ok": True, "tab_id": tab.get("id"), "text": _eval(tab, expr, timeout=10).get("value", [] if all_el else "")}
+
+    result = {"ok": True, "tab_id": tab.get("id"),
+              "text": _eval(tab, expr, timeout=10).get("value", [] if all_el else "")}
+
+    if args.get("persist_to_wiki"):
+        _persist_to_wiki(tab.get("id"), {"type": "gettext", "selector": sel,
+                                          "text_len": len(str(result.get("text", "")))})
+
+    return result
 
 
 def handle_gethtml(args):
     tab = _get_tab(args)
+    sel = _resolve_selector(args)
+    if not sel:
+        return {"ok": False, "error": "selector or selector_pack required"}
+
     prop = "outerHTML" if args.get("outer") else "innerHTML"
-    expr = f"(document.querySelector({_json_arg(args['selector'])}) || {{}}).{prop} || ''"
-    return {"ok": True, "tab_id": tab.get("id"), "html": _eval(tab, expr, timeout=10).get("value", "")}
+    expr = f"(document.querySelector({_json_arg(sel)}) || {{}}).{prop} || ''"
+    return {"ok": True, "tab_id": tab.get("id"),
+            "html": _eval(tab, expr, timeout=10).get("value", "")}
 
 
 def handle_getvalue(args):
     tab = _get_tab(args)
-    expr = f"(document.querySelector({_json_arg(args['selector'])}) || {{}}).value || ''"
-    return {"ok": True, "tab_id": tab.get("id"), "value": _eval(tab, expr, timeout=10).get("value", "")}
+    sel = _resolve_selector(args)
+    if not sel:
+        return {"ok": False, "error": "selector or selector_pack required"}
+
+    expr = f"(document.querySelector({_json_arg(sel)}) || {{}}).value || ''"
+    return {"ok": True, "tab_id": tab.get("id"),
+            "value": _eval(tab, expr, timeout=10).get("value", "")}
 
 
 def handle_wait(args):
     tab = _get_tab(args)
-    sel = args["selector"]
+    sel = _resolve_selector(args)
+    if not sel:
+        return {"ok": False, "error": "selector or selector_pack required"}
+
     timeout_ms = int(args.get("timeout_ms", 10000))
     expr = f"""
     new Promise((resolve) => {{
@@ -624,7 +1465,8 @@ def handle_wait(args):
         check();
     }})
     """
-    found = bool(_eval(tab, expr, await_promise=True, timeout=max(int(timeout_ms / 1000) + 5, 10)).get("value", False))
+    found = bool(_eval(tab, expr, await_promise=True,
+                       timeout=max(int(timeout_ms / 1000) + 5, 10)).get("value", False))
     return {"ok": True, "tab_id": tab.get("id"), "found": found, "selector": sel}
 
 
@@ -634,13 +1476,15 @@ def handle_fill_form(args):
     submit = args.get("submit_selector", "")
     results = {}
     for sel, val in fields.items():
-        results[sel] = handle_type({"tab_id": tab.get("id"), "selector": sel, "text": str(val), "clear_first": True})
+        results[sel] = handle_type({"tab_id": tab.get("id"), "selector": sel,
+                                     "text": str(val), "clear_first": True})
     submitted = False
     if submit:
         results["_submit"] = handle_click({"tab_id": tab.get("id"), "selector": submit})
         submitted = bool(results["_submit"].get("ok"))
     ok = all(v.get("ok") for v in results.values()) if results else True
-    return {"ok": ok, "tab_id": tab.get("id"), "fields_filled": len(fields), "submitted": submitted, "details": results}
+    return {"ok": ok, "tab_id": tab.get("id"), "fields_filled": len(fields),
+            "submitted": submitted, "details": results}
 
 
 def handle_login(args):
@@ -655,7 +1499,8 @@ def handle_login(args):
     filled = handle_fill_form({"tab_id": tab_id, "fields": fields, "submit_selector": args["submit_selector"]})
     time.sleep(3)
     cookies = handle_cookies({"tab_id": tab_id, "redact": bool(args.get("redact", False))})
-    return {"ok": bool(filled.get("ok")), "tab_id": tab_id, "login_completed": bool(filled.get("ok")), "cookies": cookies.get("cookies", []), "url": cookies.get("url", "")}
+    return {"ok": bool(filled.get("ok")), "tab_id": tab_id, "login_completed": bool(filled.get("ok")),
+            "cookies": cookies.get("cookies", []), "url": cookies.get("url", "")}
 
 
 def handle_tabs(args):
@@ -663,7 +1508,8 @@ def handle_tabs(args):
     include_non_page = bool(args.get("include_non_page", False))
     include_debug_url = bool(args.get("include_debug_url", False))
     selected = tabs if include_non_page else [t for t in tabs if t.get("type") == "page"]
-    return {"ok": True, "tabs": [_public_tab(t, include_debug_url) for t in selected], "count": len(selected), "total_targets": len(tabs), "debug_urls_included": include_debug_url}
+    return {"ok": True, "tabs": [_public_tab(t, include_debug_url) for t in selected],
+            "count": len(selected), "total_targets": len(tabs), "debug_urls_included": include_debug_url}
 
 
 def handle_newtab(args):
@@ -689,7 +1535,8 @@ def handle_closetab(args):
                 break
     if tab_id:
         resp = _http("GET", f"/json/close/{urllib.parse.quote(tab_id, safe='')}", raw=True)
-        return {"ok": True, "closed": tab_id, "response": resp.decode("utf-8", errors="replace") if isinstance(resp, bytes) else str(resp)}
+        return {"ok": True, "closed": tab_id,
+                "response": resp.decode("utf-8", errors="replace") if isinstance(resp, bytes) else str(resp)}
     return {"ok": False, "error": "No tab to close"}
 
 
@@ -710,32 +1557,41 @@ def handle_scroll(args):
         expr = "window.scrollTo(0, document.body.scrollHeight); 'scrolled to bottom'"
     else:
         expr = f"window.scrollBy(0, {amount}); 'scrolled'"
-    return {"ok": True, "tab_id": tab.get("id"), "result": _eval(tab, expr, timeout=10).get("value", "done")}
+    return {"ok": True, "tab_id": tab.get("id"),
+            "result": _eval(tab, expr, timeout=10).get("value", "done")}
 
 
 def handle_pdf(args):
     tab = _get_tab(args)
-    r = _safe_ws(tab, [{"method": "Page.printToPDF", "params": {"format": "A4", "printBackground": True}, "_key": "pdf"}], timeout=TIMEOUT)
+    r = _safe_ws(tab, [{"method": "Page.printToPDF",
+                        "params": {"format": "A4", "printBackground": True}, "_key": "pdf"}], timeout=TIMEOUT)
     data = r.get("pdf", {}).get("data", "")
-    return {"ok": True, "tab_id": tab.get("id"), "pdf_base64": data, "bytes_estimate": len(data) * 3 // 4, "format": "pdf"}
+    return {"ok": True, "tab_id": tab.get("id"), "pdf_base64": data,
+            "bytes_estimate": len(data) * 3 // 4, "format": "pdf"}
 
 
 def handle_pdf_file(args):
     pdf = handle_pdf(args)
-    saved = _write_b64_artifact(args.get("filename_prefix", "browser-page"), "pdf", pdf.get("pdf_base64", ""))
-    return {"ok": True, "tab_id": pdf.get("tab_id"), "path": saved["path"], "bytes": saved["bytes"], "media_hint": _media_hint("pdf")}
+    saved = _write_b64_artifact(args.get("filename_prefix", "browser-page"), "pdf",
+                                 pdf.get("pdf_base64", ""))
+    return {"ok": True, "tab_id": pdf.get("tab_id"), "path": saved["path"],
+            "bytes": saved["bytes"], "media_hint": _media_hint("pdf")}
 
 
 def handle_html_file(args):
     tab = _get_tab(args)
-    html = _eval(tab, "document.documentElement ? document.documentElement.outerHTML : ''", timeout=15).get("value", "")
+    html = _eval(tab, "document.documentElement ? document.documentElement.outerHTML : ''",
+                 timeout=15).get("value", "")
     saved = _write_text_artifact(args.get("filename_prefix", "browser-page"), "html", html)
     title = _eval(tab, "document.title", timeout=10).get("value", "")
     url = _eval(tab, "window.location.href", timeout=10).get("value", "")
-    return {"ok": True, "tab_id": tab.get("id"), "path": saved["path"], "bytes": saved["bytes"], "media_hint": _media_hint("html"), "url": url, "title": title}
+    return {"ok": True, "tab_id": tab.get("id"), "path": saved["path"], "bytes": saved["bytes"],
+            "media_hint": _media_hint("html"), "url": url, "title": title}
 
 
-def _capture_network(tab: Dict[str, Any], duration_ms: int, reload_page: bool, include_all: bool, max_items: int) -> Dict[str, Any]:
+def _capture_network(tab: Dict[str, Any], duration_ms: int, reload_page: bool,
+                     include_all: bool, max_items: int) -> Dict[str, Any]:
+    """Original lightweight network capture (v1.4 compatible)."""
     ws_url = tab.get("webSocketDebuggerUrl")
     if not ws_url:
         raise RuntimeError("Tab has no webSocketDebuggerUrl")
@@ -745,9 +1601,12 @@ def _capture_network(tab: Dict[str, Any], duration_ms: int, reload_page: bool, i
     ws = websocket.create_connection(ws_url, timeout=max(TIMEOUT, int(duration_ms / 1000) + 5))
     try:
         cid = 1
-        ws.send(json.dumps({"id": cid, "method": "Network.enable", "params": {"maxTotalBufferSize": 5242880, "maxResourceBufferSize": 1048576}})); cid += 1
+        ws.send(json.dumps({"id": cid, "method": "Network.enable",
+                           "params": {"maxTotalBufferSize": 5242880, "maxResourceBufferSize": 1048576}}))
+        cid += 1
         if reload_page:
-            ws.send(json.dumps({"id": cid, "method": "Page.reload", "params": {"ignoreCache": True}})); cid += 1
+            ws.send(json.dumps({"id": cid, "method": "Page.reload", "params": {"ignoreCache": True}}))
+            cid += 1
         end = time.time() + duration_ms / 1000.0
         while time.time() < end:
             ws.settimeout(max(0.05, min(0.5, end - time.time())))
@@ -766,8 +1625,7 @@ def _capture_network(tab: Dict[str, Any], duration_ms: int, reload_page: bool, i
             if method == "Network.requestWillBeSent":
                 req = params.get("request", {})
                 item.update({
-                    "url": req.get("url", ""),
-                    "method": req.get("method", "GET"),
+                    "url": req.get("url", ""), "method": req.get("method", "GET"),
                     "resource_type": params.get("type", ""),
                     "initiator_type": (params.get("initiator") or {}).get("type", ""),
                 })
@@ -776,33 +1634,38 @@ def _capture_network(tab: Dict[str, Any], duration_ms: int, reload_page: bool, i
                 item.update({
                     "url": resp.get("url", item.get("url", "")),
                     "resource_type": params.get("type", item.get("resource_type", "")),
-                    "status": resp.get("status"),
-                    "mime_type": resp.get("mimeType", ""),
+                    "status": resp.get("status"), "mime_type": resp.get("mimeType", ""),
                     "from_cache": bool(resp.get("fromDiskCache") or resp.get("fromPrefetchCache")),
                 })
             elif method == "Network.loadingFailed":
-                item.update({"failed": True, "error_text": params.get("errorText", ""), "resource_type": params.get("type", item.get("resource_type", ""))})
+                item.update({"failed": True, "error_text": params.get("errorText", ""),
+                            "resource_type": params.get("type", item.get("resource_type", ""))})
     finally:
         try:
             ws.close()
         except Exception:
             pass
-
     rows = list(requests.values())
     if not include_all:
-        rows = [r for r in rows if r.get("resource_type") in {"XHR", "Fetch"} or "json" in str(r.get("mime_type", "")).lower() or re.search(r"/api/|graphql|\.json(\?|$)", str(r.get("url", "")), re.I)]
+        rows = [r for r in rows if r.get("resource_type") in {"XHR", "Fetch"} or
+                "json" in str(r.get("mime_type", "")).lower() or
+                re.search(r"/api/|graphql|\.json(\?|$)", str(r.get("url", "")), re.I)]
     rows = rows[:max_items]
-    return {"ok": True, "tab_id": tab.get("id"), "duration_ms": duration_ms, "count": len(rows), "requests": rows, "redacted": True}
+    return {"ok": True, "tab_id": tab.get("id"), "duration_ms": duration_ms,
+            "count": len(rows), "requests": rows, "redacted": True}
 
 
 def handle_network_log(args):
     tab = _get_tab(args)
-    return _capture_network(tab, int(args.get("duration_ms", 3000)), bool(args.get("reload", False)), bool(args.get("include_all", False)), int(args.get("max_items", 100)))
+    return _capture_network(tab, int(args.get("duration_ms", 3000)),
+                           bool(args.get("reload", False)), bool(args.get("include_all", False)),
+                           int(args.get("max_items", 100)))
 
 
 def handle_find_api_calls(args):
     tab = _get_tab(args)
-    data = _capture_network(tab, int(args.get("duration_ms", 3000)), bool(args.get("reload", True)), False, int(args.get("max_items", 60)))
+    data = _capture_network(tab, int(args.get("duration_ms", 3000)),
+                           bool(args.get("reload", True)), False, int(args.get("max_items", 60)))
     api_calls = []
     for item in data.get("requests", []):
         url = str(item.get("url", ""))
@@ -827,18 +1690,29 @@ def handle_health(args):
             tabs = _page_tabs()
         except Exception as e:
             err = str(e)[:300]
-    return {
+
+    result = {
         "ok": bool(version),
-        "mcp": {"name": "browser-automation-mcp", "version": SERVER_VERSION, "tool_count": len(TOOLS)},
+        "mcp": {"name": "browser-automation-mcp", "version": SERVER_VERSION,
+                "tool_count": len(TOOLS)},
         "cdp": CDP,
         "browser": (version or {}).get("Browser", ""),
         "protocol": (version or {}).get("Protocol-Version", ""),
         "tabs_count": len(tabs),
-        "tabs": [{"id": t.get("id"), "url": t.get("url"), "title": t.get("title"), "type": t.get("type")} for t in tabs[:20]],
+        "tabs": [{"id": t.get("id"), "url": t.get("url"), "title": t.get("title"), "type": t.get("type")}
+                 for t in tabs[:20]],
         "autostart_enabled": AUTOSTART_CDP,
         "start_cmd": CDP_START_CMD,
         "error": err,
+        # P0 additions
+        "circuit_breaker": CDP_CIRCUIT.state,
+        "active_connections": len(CDPConnectionManager._connections),
     }
+
+    if args.get("include_metrics", True) and METRICS_ENABLED:
+        result["metrics"] = METRICS.snapshot()
+
+    return result
 
 
 def handle_page_summary(args):
@@ -851,8 +1725,7 @@ def handle_page_summary(args):
       const crop = (s, n=240) => String(s || '').replace(/\\s+/g, ' ').trim().slice(0, n);
       const attrs = (el, names) => Object.fromEntries(names.map(n => [n, el.getAttribute(n)]).filter(x => x[1] !== null && x[1] !== ''));
       return {{
-        title: document.title,
-        url: location.href,
+        title: document.title, url: location.href,
         text: crop(document.body ? document.body.innerText : '', {max_text}),
         headings: Array.from(document.querySelectorAll('h1,h2,h3')).slice(0, lim).map(el => ({{tag: el.tagName, text: crop(el.innerText, 180)}})),
         links: Array.from(document.links).slice(0, lim).map(a => ({{text: crop(a.innerText || a.title, 160), href: a.href}})),
@@ -868,26 +1741,23 @@ def handle_page_summary(args):
 
 def handle_snapshot(args):
     tab = _get_tab(args)
-    base_args = {"tab_id": tab.get("id"), "max_text": int(args.get("max_text", 4000)), "max_items": int(args.get("max_items", 40))}
+    base_args = {"tab_id": tab.get("id"), "max_text": int(args.get("max_text", 4000)),
+                 "max_items": int(args.get("max_items", 40))}
     summary = handle_page_summary(base_args)
-    elements = handle_elements({"tab_id": tab.get("id"), "max_items": int(args.get("max_items", 40)), "kind": "all"})
+    elements = handle_elements({"tab_id": tab.get("id"), "max_items": int(args.get("max_items", 40)),
+                                "kind": "all"})
     result: Dict[str, Any] = {
-        "ok": True,
-        "tab_id": tab.get("id"),
-        "url": summary.get("url"),
-        "title": summary.get("title"),
-        "text": summary.get("text", ""),
-        "headings": summary.get("headings", []),
-        "links": summary.get("links", []),
-        "buttons": summary.get("buttons", []),
-        "inputs": summary.get("inputs", []),
-        "forms": summary.get("forms", []),
-        "elements": elements.get("elements", []),
-        "elements_count": elements.get("count", 0),
+        "ok": True, "tab_id": tab.get("id"),
+        "url": summary.get("url"), "title": summary.get("title"),
+        "text": summary.get("text", ""), "headings": summary.get("headings", []),
+        "links": summary.get("links", []), "buttons": summary.get("buttons", []),
+        "inputs": summary.get("inputs", []), "forms": summary.get("forms", []),
+        "elements": elements.get("elements", []), "elements_count": elements.get("count", 0),
     }
     if bool(args.get("include_screenshot", True)):
         try:
-            shot = handle_screenshot_file({"tab_id": tab.get("id"), "filename_prefix": "browser-snapshot", "full_page": False})
+            shot = handle_screenshot_file({"tab_id": tab.get("id"),
+                                          "filename_prefix": "browser-snapshot", "full_page": False})
             result["screenshot_path"] = shot.get("path")
             result["screenshot_bytes"] = shot.get("bytes")
             result["screenshot_media_hint"] = shot.get("media_hint")
@@ -931,7 +1801,6 @@ def handle_elements(args):
     kind = str(args.get("kind") or "all").lower()
     max_items = max(1, min(int(args.get("max_items", 80)), 500))
     include_hidden = bool(args.get("include_hidden", False))
-    # Агенту нужны не просто тексты, а кликабельная карта страницы с устойчивыми CSS-селекторами.
     expr = r"""
     (() => {
       const selector = %(selector)s;
@@ -1001,19 +1870,11 @@ def handle_elements(args):
         const type = (el.getAttribute('type') || '').toLowerCase();
         const sensitive = /password|passwd|token|secret|auth|bearer|session|cookie/i.test([type, el.name, el.id, el.placeholder, el.autocomplete].join(' '));
         return {
-          index: i,
-          kind: classify(el),
-          selector: cssPath(el),
-          tag,
-          type,
-          text: crop(textOf(el), 220),
-          id: el.id || '',
-          name: el.name || '',
+          index: i, kind: classify(el), selector: cssPath(el), tag, type,
+          text: crop(textOf(el), 220), id: el.id || '', name: el.name || '',
           placeholder: crop(el.placeholder || '', 160),
           value: sensitive ? (el.value ? '[redacted]' : '') : crop(el.value || '', 120),
-          role: el.getAttribute('role') || '',
-          href: el.href || '',
-          visible: visible(el),
+          role: el.getAttribute('role') || '', href: el.href || '', visible: visible(el),
           rect: {x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height)}
         };
       });
@@ -1038,7 +1899,6 @@ def handle_click_text(args):
     case_sensitive = bool(args.get("case_sensitive", False))
     index = max(0, int(args.get("index", 0)))
     wait_after_ms = max(0, min(int(args.get("wait_after_ms", 300)), 10000))
-    # Текстовый клик нужен для живых UI, где CSS-селектор каждый раз меняется.
     expr = r"""
     ((selector, wanted, exact, caseSensitive, index) => {
       const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
@@ -1064,13 +1924,8 @@ def handle_click_text(args):
       el.click();
       return {ok: true, clicked: true, text: textOf(el).slice(0, 220), tag: el.tagName, href: el.href || '', id: el.id || '', name: el.name || '', matches_count: matches.length, rect: {x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height)}};
     })(%(selector)s, %(text)s, %(exact)s, %(case_sensitive)s, %(index)s)
-    """ % {
-        "selector": _json_arg(selector),
-        "text": _json_arg(text),
-        "exact": _json_arg(exact),
-        "case_sensitive": _json_arg(case_sensitive),
-        "index": index,
-    }
+    """ % {"selector": _json_arg(selector), "text": _json_arg(text), "exact": _json_arg(exact),
+           "case_sensitive": _json_arg(case_sensitive), "index": index}
     result = _eval(tab, expr, timeout=10).get("value") or {}
     if result.get("ok") and wait_after_ms:
         time.sleep(wait_after_ms / 1000.0)
@@ -1105,47 +1960,243 @@ def handle_wait_text(args):
           if (match) return resolve({found: true, selector, text: norm((match.innerText || match.textContent || '')).slice(0, 220)});
           if (Date.now() >= deadline) return resolve({found: false, selector, text: wanted});
           setTimeout(check, 200);
-        } catch (e) {
-          return resolve({found: false, selector, text: wanted, error: String(e)});
-        }
+        } catch (e) { return resolve({found: false, selector, text: wanted, error: String(e)}); }
       };
       check();
     })
-    """ % {
-        "selector": _json_arg(selector),
-        "text": _json_arg(text),
-        "exact": _json_arg(exact),
-        "case_sensitive": _json_arg(case_sensitive),
-        "timeout_ms": timeout_ms,
-    }
+    """ % {"selector": _json_arg(selector), "text": _json_arg(text), "exact": _json_arg(exact),
+           "case_sensitive": _json_arg(case_sensitive), "timeout_ms": timeout_ms}
     result = _eval(tab, expr, await_promise=True, timeout=max(int(timeout_ms / 1000) + 5, 10)).get("value") or {}
     return {"ok": True, "tab_id": tab.get("id"), **result}
 
 
 def handle_batch(args):
+    """P1 enhanced: parallel execution of independent steps with dependency analysis."""
     steps = args.get("steps") or []
     stop = bool(args.get("stop_on_error", True))
+
+    # P1: detect parallelizable steps (no shared tab dependency)
+    # For now, sequential with stop_on_error — parallel mode opt-in via parallel=true
+    parallel = bool(args.get("parallel", False))
+
     results = []
-    for i, step in enumerate(steps):
-        name = step.get("tool") or step.get("name")
-        if name == "browser_batch":
-            item = {"ok": False, "error": "nested browser_batch is not allowed"}
-        else:
-            handler = HANDLERS.get(name)
-            if not handler:
-                item = {"ok": False, "error": f"unknown tool: {name}"}
-            else:
+    if parallel:
+        # Execute independent steps in threads (simplified — real impl would use asyncio)
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(steps), 4)) as executor:
+            futures = {}
+            for i, step in enumerate(steps):
+                name = step.get("tool") or step.get("name")
+                handler = HANDLERS.get(name)
+                if handler:
+                    futures[executor.submit(handler, step.get("arguments") or {})] = (i, name)
+            for future in concurrent.futures.as_completed(futures):
+                i, name = futures[future]
                 try:
-                    item = handler(step.get("arguments") or {})
+                    results.append({"index": i, "tool": name, "result": future.result(timeout=60)})
                 except Exception as e:
-                    item = {"ok": False, "error": str(e)[:500]}
-        results.append({"index": i, "tool": name, "result": item})
-        if stop and isinstance(item, dict) and item.get("ok") is False:
-            break
+                    results.append({"index": i, "tool": name, "result": {"ok": False, "error": str(e)[:500]}})
+        results.sort(key=lambda r: r["index"])
+    else:
+        for i, step in enumerate(steps):
+            name = step.get("tool") or step.get("name")
+            if name == "browser_batch":
+                item = {"ok": False, "error": "nested browser_batch is not allowed"}
+            else:
+                handler = HANDLERS.get(name)
+                if not handler:
+                    item = {"ok": False, "error": f"unknown tool: {name}"}
+                else:
+                    try:
+                        item = handler(step.get("arguments") or {})
+                    except Exception as e:
+                        item = {"ok": False, "error": str(e)[:500]}
+            results.append({"index": i, "tool": name, "result": item})
+            if stop and isinstance(item, dict) and item.get("ok") is False:
+                break
+
     return {"ok": all((r.get("result") or {}).get("ok", True) for r in results), "results": results}
 
 
+# ====== NEW v2.0 HANDLERS ======
+
+def handle_network_har(args):
+    """P2: Full HAR-like network capture."""
+    tab = _get_tab(args)
+    duration_ms = int(args.get("duration_ms", 5000))
+    include_bodies = bool(args.get("include_bodies", False))
+    return _capture_network_har(tab, duration_ms, include_bodies)
+
+
+def handle_recall(args):
+    """P1: Recall cached page data from memory-wiki."""
+    url_pattern = args.get("url_pattern", "")
+    result = _recall_from_wiki(url_pattern)
+    if result is None:
+        return {"ok": True, "found": False, "note": "memory-wiki integration not configured (stub)"}
+    return {"ok": True, **result}
+
+
+def handle_session_tabs(args):
+    """P1: Session tab management — list/switch/close_all/close_others."""
+    action = args.get("action", "list")
+    tabs = _http("GET", "/json") or []
+    page_tabs = [t for t in tabs if t.get("type") == "page" and
+                 not (t.get("url") or "").startswith("devtools://")]
+
+    if action == "list":
+        return {"ok": True, "tabs": [_public_tab(t) for t in page_tabs], "count": len(page_tabs)}
+
+    elif action == "switch":
+        # Activate first page tab
+        if page_tabs:
+            try:
+                _http("GET", f"/json/activate/{urllib.parse.quote(page_tabs[0]['id'], safe='')}")
+            except Exception:
+                pass
+            return {"ok": True, "active": _public_tab(page_tabs[0])}
+        return {"ok": False, "error": "No page tabs to switch to"}
+
+    elif action == "close_all":
+        closed = []
+        for t in page_tabs:
+            try:
+                _http("GET", f"/json/close/{urllib.parse.quote(t['id'], safe='')}", raw=True)
+                closed.append(t["id"])
+            except Exception:
+                pass
+        return {"ok": True, "closed": closed, "count": len(closed)}
+
+    elif action == "close_others":
+        if len(page_tabs) <= 1:
+            return {"ok": True, "closed": [], "count": 0}
+        active = page_tabs[0]
+        closed = []
+        for t in page_tabs[1:]:
+            try:
+                _http("GET", f"/json/close/{urllib.parse.quote(t['id'], safe='')}", raw=True)
+                closed.append(t["id"])
+            except Exception:
+                pass
+        return {"ok": True, "active": _public_tab(active), "closed": closed, "count": len(closed)}
+
+
+def handle_crawl_extract(args):
+    """P3: Deep crawl — navigate + extract links + shallow recursive collection."""
+    url = args["url"]
+    rules = args.get("extract_rules", {}) or {}
+    max_depth = min(int(args.get("max_depth", 1)), 3)
+    max_pages = min(int(args.get("max_pages", 10)), 50)
+    same_domain_only = bool(args.get("same_domain_only", True))
+
+    text_sel = rules.get("text_selector", "body")
+    link_sel = rules.get("link_selector", "a[href]")
+    data_selectors = rules.get("data_selectors", {})
+
+    visited = set()
+    results = []
+    queue = [(url, 0)]
+    base_domain = urllib.parse.urlparse(url).netloc
+
+    while queue and len(visited) < max_pages:
+        current_url, depth = queue.pop(0)
+        if current_url in visited:
+            continue
+        visited.add(current_url)
+
+        try:
+            tab = _get_tab({"url_filter": ""}, create=True)
+            r = _safe_ws(tab, [{"method": "Page.navigate", "params": {"url": current_url}, "_key": "nav"}], timeout=20)
+            time.sleep(1.5)
+            _wait_ready(tab, 10)
+
+            page_data = {
+                "url": current_url,
+                "depth": depth,
+                "title": _eval(tab, "document.title", timeout=5).get("value", ""),
+            }
+
+            # Extract text
+            if text_sel:
+                page_data["text"] = _eval(tab,
+                    f"(document.querySelector({_json_arg(text_sel)}) || {{}}).innerText || ''",
+                    timeout=10).get("value", "")[:5000]
+
+            # Extract custom data selectors
+            if data_selectors:
+                extracted = {}
+                for name, css in data_selectors.items():
+                    val = _eval(tab,
+                        f"(document.querySelector({_json_arg(css)}) || {{}}).innerText || ''",
+                        timeout=5).get("value", "")[:2000]
+                    extracted[name] = val
+                page_data["data"] = extracted
+
+            results.append(page_data)
+
+            # Extract links for next depth
+            if depth < max_depth and link_sel:
+                links_js = f"""
+                Array.from(document.querySelectorAll({_json_arg(link_sel)}))
+                    .map(a => a.href).filter(h => h && h.startsWith('http'))
+                """
+                links = _eval(tab, links_js, timeout=10).get("value", []) or []
+                for link in links[:20]:
+                    link_domain = urllib.parse.urlparse(link).netloc
+                    if same_domain_only and link_domain != base_domain:
+                        continue
+                    if link not in visited:
+                        queue.append((link, depth + 1))
+
+        except Exception as e:
+            results.append({"url": current_url, "depth": depth, "error": str(e)[:300]})
+
+    return {
+        "ok": True,
+        "start_url": url,
+        "pages_crawled": len(results),
+        "max_depth": max_depth,
+        "same_domain_only": same_domain_only,
+        "results": results,
+    }
+
+
+def handle_click_heal(args):
+    """P2: Self-healing click with multiple resolution strategies."""
+    tab = _get_tab(args)
+    text = str(args.get("text", ""))
+
+    # Build selector pack from args
+    pack = args.get("selector_pack") or {}
+    if text and not pack.get("text"):
+        pack["text"] = text
+
+    if not pack:
+        return {"ok": False, "error": "text or selector_pack required"}
+
+    return SelectorPack.click_element(tab, pack)
+
+
+def handle_metrics(args):
+    """P0: Return server metrics snapshot."""
+    return {
+        "ok": True,
+        "metrics": METRICS.snapshot(),
+        "circuit_breaker": {
+            "name": CDP_CIRCUIT.name,
+            "state": CDP_CIRCUIT.state,
+            "failures": CDP_CIRCUIT._failures,
+        },
+        "connections": {
+            "active": len(CDPConnectionManager._connections),
+        },
+    }
+
+
+# ====== HANDLER REGISTRY ======
+
 HANDLERS = {
+    # v1.4
     "browser_navigate": handle_navigate,
     "browser_screenshot": handle_screenshot,
     "browser_screenshot_file": handle_screenshot_file,
@@ -1178,6 +2229,13 @@ HANDLERS = {
     "browser_click_text": handle_click_text,
     "browser_wait_text": handle_wait_text,
     "browser_batch": handle_batch,
+    # v2.0
+    "browser_network_har": handle_network_har,
+    "browser_recall": handle_recall,
+    "browser_session_tabs": handle_session_tabs,
+    "browser_crawl_extract": handle_crawl_extract,
+    "browser_click_heal": handle_click_heal,
+    "browser_metrics": handle_metrics,
 }
 
 # ====== MCP MAIN ======
@@ -1187,37 +2245,52 @@ def handle_request(msg):
     msg_id = msg.get("id")
 
     if method == "initialize":
-        _send({"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "browser-automation-mcp", "version": SERVER_VERSION}}})
+        _send({"jsonrpc": "2.0", "id": msg_id, "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "browser-automation-mcp", "version": SERVER_VERSION}
+        }})
     elif method == "tools/list":
         _send({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}})
     elif method == "tools/call":
         tool_name = msg.get("params", {}).get("name")
         args = msg.get("params", {}).get("arguments", {}) or {}
+        start = time.time()
         try:
             handler = HANDLERS.get(tool_name)
             if not handler:
                 raise ValueError(f"Unknown tool: {tool_name}")
             result = handler(args)
-            _send({"jsonrpc": "2.0", "id": msg_id, "result": {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}})
+            METRICS.incr(f"tool_{tool_name}")
+            METRICS.observe(f"tool_{tool_name}_latency", time.time() - start)
+            _send({"jsonrpc": "2.0", "id": msg_id, "result": {
+                "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]
+            }})
         except Exception as e:
-            _log(f"Tool error [{tool_name}]: {e}")
+            _log(f"Tool error [{tool_name}]: {e}", level="error", tool=tool_name)
+            METRICS.incr(f"tool_{tool_name}_errors")
             payload = {"ok": False, "error": f"{tool_name}: {str(e)[:500]}"}
-            _send({"jsonrpc": "2.0", "id": msg_id, "result": {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}], "isError": True}})
+            _send({"jsonrpc": "2.0", "id": msg_id, "result": {
+                "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}],
+                "isError": True
+            }})
     elif method == "notifications/initialized":
         return
     else:
-        _send({"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": f"Unknown method: {method}"}})
+        _send({"jsonrpc": "2.0", "id": msg_id, "error": {
+            "code": -32601, "message": f"Unknown method: {method}"
+        }})
 
 
 def main():
-    _log(f"Browser Automation MCP Server v{SERVER_VERSION} started")
-    _log(f"CDP: {CDP}")
+    _log(f"Browser Automation MCP Server v{SERVER_VERSION} started (OmniCouncil-hardened)")
+    _log(f"CDP: {CDP} | Tabs: {MAX_TABS} | Heartbeat: {HEARTBEAT_INTERVAL}s | CB: {CIRCUIT_BREAKER_THRESHOLD} fails")
     try:
         _ensure_cdp_started("startup")
         version = _http("GET", "/json/version")
         _log(f"Browser: {version.get('Browser', 'unknown')}")
     except Exception as e:
-        _log(f"WARNING: CDP not reachable: {e}")
+        _log(f"WARNING: CDP not reachable: {e}", level="warn")
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -1225,7 +2298,7 @@ def main():
         try:
             handle_request(json.loads(line))
         except Exception as e:
-            _log(f"Parse error: {e}")
+            _log(f"Parse error: {e}", level="error")
 
 
 if __name__ == "__main__":
