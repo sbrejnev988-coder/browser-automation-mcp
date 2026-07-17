@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "browser-automation-mcp"
+version = "1.5.1"
+description = "Local Chrome DevTools Protocol browser automation MCP server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Hermes Agent contributors" }]
+dependencies = ["websocket-client>=1.8.0"]
+keywords = ["mcp", "browser-automation", "cdp", "chrome-devtools-protocol", "hermes"]
+
+[project.scripts]
+browser-automation-mcp = "server:main"
+
+[tool.setuptools]
+py-modules = ["server"]
+
+[tool.pytest.ini_options]
+python_files = ["test_*.py", "*_test.py"]

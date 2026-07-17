@@ -1,0 +1,14 @@
+mcp_servers:
+  browser-automation:
+    enabled: true
+    command: /usr/bin/python3
+    args:
+      - /absolute/path/to/browser-automation/server.py
+    timeout: 120
+    connect_timeout: 30
+    env:
+      BROWSER_CDP_URL: http://127.0.0.1:9223
+      BROWSER_TIMEOUT: "30"
+      BROWSER_HTTP_TIMEOUT: "10"
+      BROWSER_AUTOSTART_CDP: "1"
+      BROWSER_ARTIFACT_DIR: /root/.hermes/cache/documents/browser-automation
