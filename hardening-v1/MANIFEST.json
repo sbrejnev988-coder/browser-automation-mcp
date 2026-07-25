@@ -1,0 +1,20 @@
+{
+  "name": "hermes-browser-memory-hardening",
+  "version": "1.0.0",
+  "date": "2026-07-25",
+  "targets": ["browser-automation-mcp", "hermes-memory-wiki"],
+  "keeps_memory_init_monolithic": true,
+  "third_party_dependencies": [],
+  "files": [
+    "apply_patch.py",
+    "verify_patch.py",
+    "uninstall_patch.py",
+    "install.sh",
+    "env.example",
+    "AUDIT_RU.md",
+    "README_RU.md",
+    "overlays/browser_security_overlay.py",
+    "overlays/memory_wiki_browser_overlay.py",
+    "tests/test_overlays.py"
+  ]
+}
