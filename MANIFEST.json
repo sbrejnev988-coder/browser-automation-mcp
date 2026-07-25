@@ -1,0 +1,40 @@
+{
+  "name": "browser-memory-wiki-overlay",
+  "version": "2026.07.25.1",
+  "targets": {
+    "browser-automation-mcp": "main / v1.5.1 layout",
+    "hermes-memory-wiki": "v1.18.3 MCP wrapper contract"
+  },
+  "changes": [
+    "CDP pending dispatcher fix",
+    "bounded reconnect state machine",
+    "Memory Wiki stdio MCP bridge",
+    "secret sanitization",
+    "artifact writer hardening",
+    "cookie validation",
+    "allowlist DNS hardening",
+    "privileged tools default-off",
+    "plaintext login schema removal"
+  ],
+  "memory_wiki_init_split": false,
+  "memory_wiki_init_modified": false,
+  "delivery": "fail-closed atomic overlay",
+  "files": [
+    "apply_overlay.py",
+    "verify_overlay.py",
+    "install.sh",
+    "rollback.sh",
+    "selftest.sh",
+    "tests/test_overlay_patcher.py",
+    "PATCH_NOTES_RU.md",
+    "HERMES_AGENT_PROMPT_RU.txt",
+    "TEST_REPORT.txt",
+    "CHECKSUMS.sha256"
+  ],
+  "verified": {
+    "py_compile": true,
+    "regression_tests": "4 passed",
+    "end_to_end_install_verify_rollback": true,
+    "memory_wiki_init_sha256_unchanged": true
+  }
+}

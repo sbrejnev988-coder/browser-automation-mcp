@@ -1,0 +1,16 @@
+Дата проверки: 2026-07-25
+
+PASS: apply_overlay.py py_compile
+PASS: verify_overlay.py py_compile
+PASS: regression tests — 4/4
+PASS: patcher idempotence
+PASS: security invariants
+PASS: CDP normal-dispatch pending invariant
+PASS: partial-overlay fail-closed
+PASS: end-to-end install -> verify -> rollback
+PASS: server.py restored to original SHA-256 after rollback
+PASS: hermes-memory-wiki/__init__.py SHA-256 unchanged during installation
+
+Ограничение проверки:
+Инсталлятор использует строгие якоря структуры browser-automation-mcp v1.5.1.
+При несовпадении текущего main он завершится до записи server.py и выведет точную ошибку.
