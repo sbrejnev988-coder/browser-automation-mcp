@@ -1,0 +1,31 @@
+name: hermes-omnicouncil
+version: 5.6.3
+description: "Hermes OmniCouncil v5.6.3 — консилиум из ЛЮБЫХ моделей (OpenRouter, Anthropic, OpenAI, DeepSeek, локальные, custom) через provider:model синтаксис. Council-safe режим: модели читают workspace/memory + пишут blackboard, мутации — только operator. явный COUNCIL_DENIED_TOOLS deny-list, broker_tool_call единая точка входа, двухуровневый blackboard (ephemeral + durable memory-wiki), MUTATION_POLICY (propose_only/judge_approved/operator_only). Presets — только sizing, модели — из аргументов пользователя."
+tools:
+  - hermes_omnicouncil
+  - omnicouncil_doctor
+  - omnicouncil_cache_list
+  - omnicouncil_cache_get
+  - omnicouncil_cache_clear
+  - omnicouncil_cache_explain_key
+  - deep_web_crawl
+  - deep_web_status
+  - deep_web_open_report
+  - deep_web_query_sources
+  - deep_web_delete_job
+  - deep_web_export
+  - deep_web_resume
+provides_tools:
+  - hermes_omnicouncil
+  - omnicouncil_doctor
+  - omnicouncil_cache_list
+  - omnicouncil_cache_get
+  - omnicouncil_cache_clear
+  - omnicouncil_cache_explain_key
+  - deep_web_crawl
+  - deep_web_status
+  - deep_web_open_report
+  - deep_web_query_sources
+  - deep_web_delete_job
+  - deep_web_export
+  - deep_web_resume
